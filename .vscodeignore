@@ -17,6 +17,7 @@ test/**
 *.vsix
 .github/**
 scripts/**
+RPC_*.md
 tsconfig.json
 TODO.md
 AGENTS.md
