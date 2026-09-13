@@ -14,7 +14,8 @@ const root = resolve(dirname(script), "..");
 const pause = ms => new Promise(done => setTimeout(done, ms));
 if (!process.argv.includes("--worker")) {
     if (process.platform === "win32") throw new Error("This executable-fixture smoke requires POSIX; run Windows validation separately.");
-    for (const scenario of ["config-local", "config-pnpm", "config-managed", "local", "prefix", "old", "unknown", "missing", "newer", "npx-fallback", "timeout", "cancel", "explicit-old", "explicit-missing", "explicit-pnpm", "explicit-npx", "legacy-args", "legacy-version"]) {
+    const selected = process.argv.slice(2);
+    for (const scenario of selected.length ? selected : ["writer-lock", "runtime-error", "download-fallback", "config-local", "config-pnpm", "config-managed", "local", "prefix", "old", "unknown", "missing", "newer", "npx-fallback", "timeout", "cancel", "explicit-old", "explicit-missing", "explicit-pnpm", "explicit-npx", "legacy-args", "legacy-version"]) {
         const directory = await mkdtemp(join(tmpdir(), "dsh-discovery-verify-"));
         try {
             const child = spawn(process.execPath, [script, "--worker", scenario], {
@@ -33,6 +34,7 @@ if (!process.argv.includes("--worker")) {
     const bin = join(directory, "bin");
     const prefix = join(directory, "prefix");
     const marker = join(directory, "launched.json");
+    const attempts = join(directory, "attempts.jsonl");
     const probeMarker = join(directory, "probe-started");
     await mkdir(bin);
     await mkdir(join(prefix, "bin"), { recursive: true });
@@ -50,6 +52,21 @@ if (args.includes('--version')) {
 if (args[0] === 'prefix') { console.log(${JSON.stringify(prefix)}); process.exit(0); }
 if (args[0] === 'config') { console.log('https://registry.npmjs.org'); process.exit(0); }
 fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({name:${JSON.stringify(name)}, args}));
+fs.appendFileSync(${JSON.stringify(attempts)}, JSON.stringify(args) + '\\n');
+if (${JSON.stringify(scenario)} === 'writer-lock') {
+    console.error('file:///cache/pnpm/store/runtime.js');
+    console.error('Error: atomic-write: timed out waiting for the writer lock at /fixture/profiles/node_modules.lock');
+    process.exit(1);
+}
+if (${JSON.stringify(scenario)} === 'runtime-error') {
+    console.error('file:///cache/pnpm/store/runtime.js');
+    console.error('Error: invalid profile configuration');
+    process.exit(1);
+}
+if (${JSON.stringify(scenario)} === 'download-fallback' && !args.some(arg => arg.startsWith('--config.registry='))) {
+    console.error('ERR_PNPM_FETCH_502 GET https://registry.npmjs.org/@deepseek-ai/dsh: Bad Gateway');
+    process.exit(1);
+}
 setInterval(() => {}, 1000);
 }
 `, { mode: 0o700 });
@@ -71,7 +88,8 @@ setInterval(() => {}, 1000);
     if (scenario === "config-pnpm") settings.set("command", "pnpm");
     if (scenario === "explicit-old") settings.set("command", join(bin, "dsh"));
     if (scenario === "explicit-missing") settings.set("command", join(bin, "absent-dsh"));
-    if (scenario === "explicit-pnpm") settings.set("command", "pnpm");
+    if (["explicit-pnpm", "writer-lock", "runtime-error", "download-fallback"].includes(scenario)) settings.set("command", "pnpm");
+    if (scenario === "runtime-error") settings.set("recovery.enabled", false);
     if (scenario === "explicit-npx") settings.set("command", "npx");
     if (scenario === "legacy-args") settings.set("commandArgs", ["dlx", "@deepseek-ai/dsh", "web", "--no-open", "--port", "49151"]);
     if (scenario === "legacy-version") settings.set("commandArgs", ["dlx", "@deepseek-ai/dsh@0.1.2-rc.1", "web", "--no-open"]);
@@ -97,15 +115,33 @@ setInterval(() => {}, 1000);
     // version probes, actual spawn, argv and lock lifecycle remain production code.
     runtime.findExistingRuntime = async () => undefined;
     runtime.harnessState.start = () => {};
-    runtime.waitForReady = async () => {
+    const waitForReady = runtime.waitForReady.bind(runtime);
+    let readinessCalls = 0;
+    runtime.waitForReady = async (...args) => {
+        readinessCalls += 1;
+        if (["writer-lock", "runtime-error"].includes(scenario) ||
+            (scenario === "download-fallback" && readinessCalls === 1)) return waitForReady(...args);
         const deadline = Date.now() + 3000;
         while (Date.now() < deadline) {
-            try { await readFile(marker); return "http://127.0.0.1:1"; } catch { await pause(20); }
+            try {
+                const launched = JSON.parse(await readFile(marker, "utf8"));
+                if (scenario !== "download-fallback" || launched.args.some(arg => arg.startsWith("--config.registry="))) {
+                    return "http://127.0.0.1:1";
+                }
+            } catch { /* Fixture has not written its launch record yet. */ }
+            await pause(20);
         }
         throw new Error("CLI never launched");
     };
     try {
-        if (scenario.startsWith("config-")) {
+        if (["writer-lock", "runtime-error", "download-fallback"].includes(scenario)) {
+            if (scenario === "download-fallback") await runtime.start(directory);
+            else await assert.rejects(() => runtime.start(directory),
+                scenario === "writer-lock" ? /atomic-write: timed out waiting/u : /invalid profile configuration/u);
+            const launches = (await readFile(attempts, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+            assert.equal(launches.length, scenario === "download-fallback" ? 2 : 1);
+            assert.equal(runtime.getRecoveryStatus(), undefined, "writer-lock failures must not start bundle isolation");
+        } else if (scenario.startsWith("config-")) {
             await assert.rejects(() => runtime.start(directory), /dsh\.runtimeVersion.*0\.1\.2-rc\.1.*0\.1\.5-rc\.1/u);
             await assert.rejects(() => runtime.diagnoseEnvironment(directory), /dsh\.runtimeVersion/u);
             await assert.rejects(() => readFile(probeMarker), { code: "ENOENT" });

@@ -191,6 +191,8 @@ export class RemoteStreamMuxClient implements AsyncDisposable {
                 if (settled) return;
                 settled = true;
                 cleanup();
+                // Node ws emits an error when a pending handshake is closed.
+                socket.addEventListener("error", () => {}, { once: true });
                 socket.close();
                 reject(error);
             };
