@@ -29,12 +29,11 @@ function bundleVariant(
     kind: VariantKind,
     selected: readonly string[],
     assumption: string,
-    candidate?: CandidateFix,
 ): CompositionVariant {
     const selectedSet = new Set(selected);
     const bundles = base.bundles.map((bundle) => ({
         ...bundle,
-        selected: selectedSet.has(bundle.packageName),
+        selected: bundle.origin === "installation" ? bundle.selected : selectedSet.has(bundle.packageName),
     }));
     const composition = recomputeComposition(base, { bundles });
     return {
@@ -42,9 +41,8 @@ function bundleVariant(
         kind,
         parentHash: base.compositionHash,
         assumption,
-        bundleSelection: [...selected],
+        bundleSelection: bundles.filter(bundle => bundle.selected).map(bundle => bundle.packageName),
         composition,
-        ...(candidate === undefined ? {} : { candidateFix: candidate }),
     };
 }
 
@@ -60,7 +58,7 @@ function overlayVariant(base: CompositionDescriptor): CompositionVariant {
         id: idFor("v4-extension-overlays-removed", removed),
         kind: "remove-extension-overlay",
         targetIds: removed.map((path) => basename(path)),
-        reason: "The original composition is unhealthy without the extension-owned patch layer.",
+        reason: "The composition becomes healthy after removing the extension-owned patch layer.",
         evidenceBootIds: [],
         precondition: {
             runtimeMustBeDead: true,
@@ -152,7 +150,6 @@ export class VariantEngine {
             .filter((bundle) => bundle.selected && bundle.origin === "profile-dependency")
             .map((bundle) => bundle.packageName);
         if (userBundles.length > 0) {
-            const baseSelected = userBundles;
             const empty = bundleVariant(
                 composition,
                 "v3-all-user-bundles-removed",
@@ -164,53 +161,27 @@ export class VariantEngine {
             }
             add(empty);
 
-            const halves: string[][] = [];
-            const midpoint = Math.ceil(userBundles.length / 2);
-            halves.push(userBundles.slice(0, midpoint));
-            if (midpoint < userBundles.length) halves.push(userBundles.slice(midpoint));
-            for (const half of halves) {
-                const variant = bundleVariant(
-                    composition,
-                    "v3-bundle-half-added",
-                    half,
-                    `Only this bundle half is retained: ${half.join(", ")}`,
-                    undefined,
-                );
-                const removed = baseSelected.filter((name) => !half.includes(name));
+            const addSelection = (kind: VariantKind, selected: string[], assumption: string): void => {
+                const variant = bundleVariant(composition, kind, selected, assumption);
+                const removed = userBundles.filter(name => !selected.includes(name));
                 variant.candidateFix = bundleCandidate(composition, variant, removed);
                 add(variant);
+            };
+            const midpoint = Math.ceil(userBundles.length / 2);
+            const halves = [userBundles.slice(0, midpoint), userBundles.slice(midpoint)];
+            for (const half of halves.filter(half => half.length)) {
+                addSelection("v3-bundle-half-added", half, `Only this bundle half is retained: ${half.join(", ")}`);
             }
             for (const bundle of userBundles) {
-                const variant = bundleVariant(
-                    composition,
-                    "v3-bundle-singleton",
-                    [bundle],
-                    `Only this bundle is retained: ${bundle}`,
-                );
-                variant.candidateFix = bundleCandidate(
-                    composition,
-                    variant,
-                    userBundles.filter((name) => name !== bundle),
-                );
-                add(variant);
+                addSelection("v3-bundle-singleton", [bundle], `Only this bundle is retained: ${bundle}`);
             }
         }
-        // Design 7.1: keep enough boots in reserve that the single-shot V1/V4 probes and the
-        // re-add confirmation still fit. V3's allowance is `1 + ceil(log2(n)) + 1` for n user
-        // bundles: one all-removed baseline, the bisection steps, and the confirmation. The
-        // planner is the only place n is known, so it computes `reserved` here rather than
-        // leaving the hardcoded placeholder that nothing ever read.
         const limit = Math.max(1, budget.maxBoots);
-        const plannedBundles = composition.bundles
-            .filter((bundle) => bundle.selected && bundle.origin === "profile-dependency").length;
-        // Design 571: when the formula exceeds the budget, record the shortfall and truncate by
-        // discriminating power instead of silently growing the cap. The planner already emits
-        // variants most-discriminating-first (V1, then V3 baseline/halves/singletons, then V4),
-        // so a plain slice is that order.
+        const plannedBundles = userBundles.length;
         budget.reserved = {
             v1: 1,
-            v3: 1 + Math.ceil(Math.log2(Math.max(1, plannedBundles))) + 1,
-            v4: 1,
+            v3: plannedBundles ? 1 + Math.ceil(Math.log2(plannedBundles)) + 1 : 0,
+            v4: composition.extensionOverlayPaths.length ? 1 : 0,
             confirmation: 1,
         };
         if (budget.reserved.v1 + budget.reserved.v3 + budget.reserved.v4 + budget.reserved.confirmation > limit) {
@@ -222,11 +193,7 @@ export class VariantEngine {
         return variants.slice(0, limit);
     }
 
-    /**
-     * Design 7.3 step 5: the confirmation is two-directional. Removing the candidate
-     * set must pass (the healthy variant the caller already found), and re-adding
-     * *only* the candidate set must fail. This builds the second direction.
-     */
+    /** Confirm that re-adding only the candidate set reproduces the original failure. */
     public readdConfirmation(
         base: CompositionDescriptor,
         targetIds: readonly string[],

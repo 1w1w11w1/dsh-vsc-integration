@@ -1,3 +1,4 @@
+import { isRecord } from "../guards";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
@@ -33,10 +34,6 @@ export interface LedgerReadResult {
     state: RecoveryLedgerState;
     exists: boolean;
     corrupt?: RecoveryLedgerCorruptError;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function validLedger(value: unknown): value is RecoveryLedgerState {
@@ -207,6 +204,17 @@ export class RecoveryLedgerStore {
             state.sessions.push(session);
         }, loaded.state.revision);
         return session;
+    }
+
+    public async reserveBoot(sessionId: string): Promise<void> {
+        await this.update(state => {
+            const session = state.sessions.find(item => item.id === sessionId);
+            if (!session || state.activeSessionId !== sessionId ||
+                session.budget.usedBoots >= session.budget.maxBoots) {
+                throw new Error("Recovery boot budget or session ownership changed");
+            }
+            session.budget.usedBoots += 1;
+        });
     }
 
     public async appendEvidence(

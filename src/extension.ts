@@ -152,9 +152,6 @@ export function activate(context: vscode.ExtensionContext): DshExtensionApi {
             runtime.cancelRecovery();
         }),
         vscode.commands.registerCommand("dsh.recovery.openDiagnostics", async () => {
-            // Design 968: this command opens the CURRENT session's details and logs. It used to
-            // be a byte-for-byte duplicate of dsh.openLogs, so the two entries in the command
-            // palette did the same thing and neither showed any recovery detail.
             const status = runtime.getRecoveryStatus();
             output.show(true);
             if (status === undefined) {

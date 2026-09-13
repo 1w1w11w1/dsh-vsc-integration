@@ -3,6 +3,7 @@
 // (not the recovery module in isolation) against a genuinely broken DSH profile, and asserts
 // the user-visible outcome: status transitions, the persisted profile fix, and restore.
 import assert from "node:assert/strict";
+import { createRecoveryLauncher } from "./recovery-fixture-launcher.mjs";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
@@ -97,53 +98,7 @@ server.listen(requested, "127.0.0.1", () => console.log("http://127.0.0.1:" + se
 process.on("SIGTERM", () => server.close(() => process.exit(0)));
 `, { encoding: "utf8", mode: 0o600 });
 
-    // A dsh-shaped launcher: answers --version itself (the extension probes any custom
-    // command), then hands the real launch to node running the fake runtime.
-    // The launcher must be a DIRECT .exe: the Oracle treats any non-.exe command as a cmd.exe
-    // wrapper, whose descendant ownership Windows cannot verify, and it then defers cleanup and
-    // aborts the whole search after a single boot. It must also answer --version itself, because
-    // a custom command is version-probed before the extension will launch it. Build both into a
-    // small native shim.
-    const shimDir = join(directory, "shim");
-    await mkdir(shimDir, { recursive: true });
-    const shim = join(shimDir, "dsh.exe");
-    const shimTarget = join(shimDir, "fake-dsh.cjs");
-    await writeFile(shimTarget, await readFile(fakeDsh, "utf8"), { encoding: "utf8" });
-    const nodeExe = process.execPath;
-    await writeFile(join(shimDir, "shim.cs"), `using System;
-using System.Diagnostics;
-using System.IO;
-using System.Text;
-class DshShim {
-    static int Main(string[] args) {
-        foreach (var a in args) {
-            if (a == "--version") { Console.WriteLine("0.1.5-rc.1"); return 0; }
-        }
-        var dir = AppDomain.CurrentDomain.BaseDirectory;
-        var psi = new ProcessStartInfo(${JSON.stringify(nodeExe)},
-            "\\"" + Path.Combine(dir, "fake-dsh.cjs") + "\\" " + JoinArgs(args));
-        psi.UseShellExecute = false;
-        var p = Process.Start(psi);
-        p.WaitForExit();
-        return p.ExitCode;
-    }
-    static string JoinArgs(string[] args) {
-        var sb = new StringBuilder();
-        foreach (var a in args) { sb.Append('\\"'); sb.Append(a.Replace("\\"", "\\\\\\"")); sb.Append('\\"'); sb.Append(' '); }
-        return sb.ToString();
-    }
-}
-`, { encoding: "utf8" });
-    const csc = "C:\\\\Windows\\\\Microsoft.NET\\\\Framework64\\\\v4.0.30319\\\\csc.exe";
-    const built = await new Promise((done, reject) => {
-        const child = spawn(csc, ["/nologo", "/out:" + shim, join(shimDir, "shim.cs")],
-            { stdio: ["ignore", "ignore", "pipe"] });
-        let err = "";
-        child.stderr.on("data", chunk => { err += chunk; });
-        child.once("error", reject);
-        child.once("exit", code => code === 0 ? done(true) : reject(new Error("csc failed: " + err)));
-    });
-    assert.ok(built && existsSync(shim), "the native launcher shim must build");
+    const shim = await createRecoveryLauncher(directory, fakeDsh);
 
     const Module = require("node:module");
     const originalLoad = Module._load;

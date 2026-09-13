@@ -4,10 +4,18 @@ import { t } from "../i18n";
 import type { StatusBannerState } from "../state";
 import { CloseIcon } from "./icons";
 
+const ACTION_LABELS = {
+    cancelRecovery: "Cancel recovery",
+    openLogs: "View details",
+    restoreRecovery: "Restore",
+    exportRecoveryDiagnostics: "Export diagnostics",
+    start: "Retry",
+} as const;
+
 export function StatusBanner({ status, sessionStatus }: StatusBannerState): React.JSX.Element | null {
     const recovery = status.recovery;
     const recovering = status.state === "recovering";
-    const recovered = recovery?.phase === "recovered" && status.state === "running";
+    const recovered = recovery?.phase === "recovered" && status.state === "running" && !sessionStatus?.error;
     const runtimeError = status.state === "error" ? status.message : undefined;
     const sessionError = sessionStatus?.error;
     const message = sessionError || runtimeError;
@@ -22,13 +30,17 @@ export function StatusBanner({ status, sessionStatus }: StatusBannerState): Reac
         setDismissedKey(undefined);
     }, [messageKey]);
 
-    // `recovering` keeps its banner because it carries the cancel action; the
-    // informational `recovered` banner must be dismissable (design 13.1).
+    // Keep the cancel action visible throughout recovery.
     if (!recovering && messageKey !== undefined && messageKey === dismissedKey) return null;
     if (!recovering && !recovered && !message) return null;
 
     const terminalRecovery = recovery?.phase === "unrecoverable" || recovery?.phase === "cancelled";
-    const isSessionError = Boolean(sessionError);
+    const actions: Array<keyof typeof ACTION_LABELS> = recovering
+        ? ["cancelRecovery", "openLogs"]
+        : recovered
+            ? ["restoreRecovery", "exportRecoveryDiagnostics"]
+            : [sessionError ? "openLogs" : terminalRecovery ? "exportRecoveryDiagnostics" : "start"];
+    if (!recovering && !recovered && recovery?.canRestore) actions.push("restoreRecovery");
     const bannerMessage = recovering
         ? `${status.message || t("Automatic recovery is in progress")} (${recovery?.usedBoots ?? 0}/${recovery?.maxBoots ?? 8})`
         : recovered
@@ -42,56 +54,18 @@ export function StatusBanner({ status, sessionStatus }: StatusBannerState): Reac
             <div className="dsh-error-banner-content">
                 <span className="dsh-error-banner-message">{bannerMessage}</span>
                 <div className="dsh-error-banner-actions">
-                    {recovering ? (
-                        <>
-                            <button type="button" className="dsh-button dsh-button-secondary"
-                                onClick={() => postAction({ type: "cancelRecovery" })}>
-                                {t("Cancel recovery")}
-                            </button>
-                            <button type="button" className="dsh-button dsh-button-secondary"
-                                onClick={() => postAction({ type: "openLogs" })}>
-                                {t("View details")}
-                            </button>
-                        </>
-                    ) : recovered ? (
-                        <>
-                            <button type="button" className="dsh-button dsh-button-secondary"
-                                onClick={() => postAction({ type: "restoreRecovery" })}>
-                                {t("Restore")}
-                            </button>
-                            <button type="button" className="dsh-button dsh-button-secondary"
-                                onClick={() => postAction({ type: "exportRecoveryDiagnostics" })}>
-                                {t("Export diagnostics")}
-                            </button>
-                            <button type="button" className="dsh-icon-button"
-                                aria-label={t("Dismiss")} title={t("Dismiss")}
-                                onClick={() => setDismissedKey(messageKey)}>
-                                <CloseIcon />
-                            </button>
-                        </>
-                    ) : (
-                        <>
-                            <button type="button" className="dsh-button dsh-button-secondary"
-                                onClick={() => postAction({
-                                    type: isSessionError ? "openLogs" : terminalRecovery
-                                        ? "exportRecoveryDiagnostics" : "start",
-                                })}>
-                                {isSessionError
-                                    ? t("View details")
-                                    : terminalRecovery ? t("Export diagnostics") : t("Retry")}
-                            </button>
-                            {recovery?.canRestore ? (
-                                <button type="button" className="dsh-button dsh-button-secondary"
-                                    onClick={() => postAction({ type: "restoreRecovery" })}>
-                                    {t("Restore")}
-                                </button>
-                            ) : null}
-                            <button type="button" className="dsh-icon-button"
-                                aria-label={t("Dismiss")} title={t("Dismiss")}
-                                onClick={() => setDismissedKey(messageKey)}>
-                                <CloseIcon />
-                            </button>
-                        </>
+                    {actions.map(type => (
+                        <button key={type} type="button" className="dsh-button dsh-button-secondary"
+                            onClick={() => postAction({ type })}>
+                            {t(ACTION_LABELS[type])}
+                        </button>
+                    ))}
+                    {!recovering && (
+                        <button type="button" className="dsh-icon-button"
+                            aria-label={t("Dismiss")} title={t("Dismiss")}
+                            onClick={() => setDismissedKey(messageKey)}>
+                            <CloseIcon />
+                        </button>
                     )}
                 </div>
             </div>

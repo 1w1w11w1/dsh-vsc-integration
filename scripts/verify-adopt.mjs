@@ -8,8 +8,8 @@
 // timers plus a full sandbox search. Case 1 drives the real DshRuntime end to end, which is the
 // regression guard that actually pins "no healthy Runtime listening -> adoption declines".
 import assert from "node:assert/strict";
+import { createRecoveryLauncher } from "./recovery-fixture-launcher.mjs";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -39,6 +39,7 @@ if (!process.argv.includes("--worker")) {
     let timer;
     try {
         const child = spawn(process.execPath, [script, "--worker"], {
+            detached: process.platform !== "win32",
             env: { ...process.env, TMPDIR: directory, TMP: directory, TEMP: directory,
                 // homedir() is read from these at module-load time; point them at the fixture
                 // so both the extension and the fake runtime resolve the same DSH home.
@@ -70,7 +71,11 @@ if (!process.argv.includes("--worker")) {
             // The worker's fixture tree (shim -> node -> listener) must die too, or it outlives
             // this run and poisons the next one on the same port.
             if (child.pid !== undefined) {
-                spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+                if (process.platform === "win32") {
+                    spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+                } else {
+                    try { process.kill(-child.pid, "SIGKILL"); } catch { /* Already exited. */ }
+                }
             }
             child.kill();
             await outcome.catch(() => undefined);
@@ -149,33 +154,7 @@ const dieFile = process.env.ADOPT_DIE_FILE;
 const dieWatch = setInterval(() => { if (dieFile && fs.existsSync(dieFile)) { clearInterval(dieWatch); process.exit(9); } }, 100);
 setTimeout(() => process.exit(9), 15_000);
 `, { encoding: "utf8", mode: 0o600 });
-    // A dsh-shaped launcher: answers --version itself (the extension probes any custom
-    // command), then hands the real launch to node running the fake runtime.
-    // The launcher must be a DIRECT .exe: the Oracle treats any non-.exe command as a cmd.exe
-    // wrapper, whose descendant ownership Windows cannot verify, and it then defers cleanup and
-    // aborts the whole search after a single boot.
-    const shimDir = join(directory, "shim");
-    await mkdir(shimDir, { recursive: true });
-    const shim = join(shimDir, "dsh.exe");
-    await writeFile(join(shimDir, "fake-dsh.cjs"), await readFile(fakeDsh, "utf8"), { encoding: "utf8" });
-    const nodeExe = process.execPath;
-    // The C# launcher lives in a sibling file so it needs no nested template escaping.
-    await writeFile(join(shimDir, "shim.cs"), await readFile(join(dirname(script), "verify-adopt-shim.cs"), "utf8"), { encoding: "utf8" });
-    const csc = "C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\csc.exe";
-    const built = await new Promise((done, reject) => {
-        const child = spawn(csc, ["/nologo", "/out:" + shim, join(shimDir, "shim.cs")],
-            { stdio: ["ignore", "pipe", "pipe"] });
-        let detail = "";
-        child.stdout.on("data", chunk => { detail += chunk; });
-        child.stderr.on("data", chunk => { detail += chunk; });
-        child.once("error", reject);
-        child.once("exit", code => {
-            if (code === 0) done(true);
-            else reject(new Error(`csc failed (exit ${code ?? "null"}): ${detail}`));
-        });
-    });
-    assert.ok(built && existsSync(shim), "the native launcher shim must build");
-
+    const shim = await createRecoveryLauncher(directory, fakeDsh);
 
     const Module = require("node:module");
     const originalLoad = Module._load;

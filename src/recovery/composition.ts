@@ -1,3 +1,4 @@
+import { isRecord } from "../guards";
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -13,6 +14,11 @@ import type {
 
 const SECRET_NAME = /(?:api[-_]?key|auth|credential|password|secret|token|cookie|private[-_]?key)/iu;
 const SECRET_FILE = /(?:^|[\\/])(?:\.env(?:\.[^\\/]+)?|\.credentials(?:\.[^\\/]+)?|.*secret.*)$/iu;
+// Shipped profile bundles are resolved by the running CLI from its own installation.
+const INSTALLATION_BUNDLES = new Set([
+    "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-acp-app", "@deepseek-ai/dsh-web-app",
+    "@deepseek-ai/dsh-headless", "@deepseek-ai/dsh-sdk-app", "@deepseek-ai/dsh-sdk-minimal",
+]);
 const MAX_HASHED_FILE_BYTES = 2 * 1024 * 1024;
 
 function sha256(value: string | Uint8Array): string {
@@ -75,27 +81,16 @@ async function fingerprintPath(path: string): Promise<FileFingerprint> {
             return { path: normalized, kind: "directory", mtimeMs: stat.mtimeMs };
         }
         if (!stat.isFile()) return { path: normalized, kind: "missing" };
+        const fingerprint: FileFingerprint = { path: normalized, kind: "file", size: stat.size, mtimeMs: stat.mtimeMs };
         if (secretPath(path)) {
             return {
-                path: normalized,
-                kind: "file",
-                size: stat.size,
-                mtimeMs: stat.mtimeMs,
+                ...fingerprint,
                 secret: true,
                 contentHash: sha256(`secret-present:${stat.size}:${stat.mtimeMs}`),
             };
         }
-        if (stat.size > MAX_HASHED_FILE_BYTES) {
-            return { path: normalized, kind: "file", size: stat.size, mtimeMs: stat.mtimeMs };
-        }
-        const contents = await readFile(path);
-        return {
-            path: normalized,
-            kind: "file",
-            size: stat.size,
-            mtimeMs: stat.mtimeMs,
-            contentHash: sha256(contents),
-        };
+        if (stat.size > MAX_HASHED_FILE_BYTES) return fingerprint;
+        return { ...fingerprint, contentHash: sha256(await readFile(path)) };
     } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") {
             return { path: normalized, kind: "missing" };
@@ -104,7 +99,7 @@ async function fingerprintPath(path: string): Promise<FileFingerprint> {
     }
 }
 
-function profileFromArgs(args: readonly string[]): string {
+export function profileNameFromArgs(args: readonly string[]): string {
     const inline = args.find((argument) => argument.startsWith("--profile="));
     if (inline) return inline.slice("--profile=".length) || "default";
     const index = args.findIndex((argument) => argument === "--profile");
@@ -145,11 +140,8 @@ function parsePatchLayer(path: string, order: number, extensionOverlayPaths: rea
 async function readPackageJson(path: string): Promise<Record<string, unknown> | undefined> {
     try {
         const value: unknown = JSON.parse(await readFile(path, "utf8"));
-        return value && typeof value === "object" && !Array.isArray(value)
-            ? value as Record<string, unknown>
-            : undefined;
-    } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+        return isRecord(value) ? value : undefined;
+    } catch {
         return undefined;
     }
 }
@@ -158,29 +150,27 @@ async function resolveBundle(
     packageName: string,
     profileDir: string,
 ): Promise<BundleDescriptor> {
+    if (INSTALLATION_BUNDLES.has(packageName)) {
+        return { packageName, origin: "installation", selected: true };
+    }
     const packageDir = join(profileDir, "node_modules", packageName);
     const packageJsonPath = join(packageDir, "package.json");
     const packageJson = await readPackageJson(packageJsonPath);
+    const packageExists = (await fingerprintPath(packageDir)).kind !== "missing";
     const packageHash = packageJson ? sha256(JSON.stringify(stableValue(packageJson))) : undefined;
     const dsh = packageJson?.dsh;
-    const bundle = dsh && typeof dsh === "object" && !Array.isArray(dsh)
-        ? (dsh as Record<string, unknown>).bundle
-        : undefined;
-    const patchValue = bundle && typeof bundle === "object" && !Array.isArray(bundle)
-        ? (bundle as Record<string, unknown>).patch
-        : undefined;
+    const bundle = isRecord(dsh) ? dsh.bundle : undefined;
+    const patchValue = isRecord(bundle) ? bundle.patch : undefined;
     const patchPath = typeof patchValue === "string"
         ? resolve(packageDir, patchValue)
         : undefined;
     const patchFingerprint = patchPath ? await fingerprintPath(patchPath) : undefined;
     return {
         packageName,
-        packageDir: (await fingerprintPath(packageDir)).kind === "missing" ? undefined : normalizedPath(packageDir),
+        packageDir: packageExists ? normalizedPath(packageDir) : undefined,
         manifestPath: normalizedPath(packageJsonPath),
         patchPath: patchPath && patchFingerprint?.kind !== "missing" ? normalizedPath(patchPath) : undefined,
-        origin: (await fingerprintPath(packageDir)).kind === "missing"
-            ? "unknown"
-            : "profile-dependency",
+        origin: packageExists ? "profile-dependency" : "unknown",
         selected: true,
         packageHash,
         patchHash: patchFingerprint?.contentHash,
@@ -191,12 +181,8 @@ async function readBundles(manifestPath: string | undefined, profileDir: string)
     if (!manifestPath) return [];
     const packageJson = await readPackageJson(manifestPath);
     const dsh = packageJson?.dsh;
-    const profile = dsh && typeof dsh === "object" && !Array.isArray(dsh)
-        ? (dsh as Record<string, unknown>).profile
-        : undefined;
-    const bundles = profile && typeof profile === "object" && !Array.isArray(profile)
-        ? (profile as Record<string, unknown>).bundles
-        : undefined;
+    const profile = isRecord(dsh) ? dsh.profile : undefined;
+    const bundles = isRecord(profile) ? profile.bundles : undefined;
     if (!Array.isArray(bundles)) return [];
     const result: BundleDescriptor[] = [];
     for (const value of bundles) {
@@ -233,7 +219,7 @@ function normalizeArgsForHash(args: readonly string[]): string[] {
     for (let index = 0; index < result.length; index += 1) {
         if ((result[index] === "--port" || result[index] === "-p") && result[index + 1] === "0") {
             result[index + 1] = "<dynamic-port>";
-        } else if (result[index]?.startsWith("--port=0")) {
+        } else if (result[index] === "--port=0") {
             result[index] = "--port=<dynamic-port>";
         }
     }
@@ -272,10 +258,10 @@ export interface CompositionInput {
 
 export async function buildComposition(input: CompositionInput): Promise<CompositionDescriptor> {
     const dshHome = resolve(input.dshHome || process.env.DSH_HOME || join(homedir(), ".dsh"));
-    const profile = input.profile || profileFromArgs(input.appArgs);
+    const profile = input.profile || profileNameFromArgs(input.appArgs);
     const profileDir = join(dshHome, "profiles", profile);
     const profileManifestPath = input.profileManifestPath || join(profileDir, "package.json");
-    const patchPaths = patchPathsFromArgs(input.appArgs);
+    const patchPaths = patchPathsFromArgs(input.appArgs).map(path => resolve(input.workspaceRoot, path));
     const extensionOverlayPaths = [...(input.extensionOverlayPaths ?? [])].map(normalizedPath);
     const recoveryOverlayPaths = [...(input.recoveryOverlayPaths ?? [])].map(normalizedPath);
     const patchLayers: PatchLayerDescriptor[] = [];
@@ -310,7 +296,7 @@ export async function buildComposition(input: CompositionInput): Promise<Composi
     const composition = {
         schemaVersion: 1 as const,
         profile,
-        ...(await fingerprintPath(profileManifestPath)).kind === "missing"
+        ...profileManifest.kind === "missing"
             ? {}
             : { profileManifestPath: normalizedPath(profileManifestPath) },
         ...(profileManifest.contentHash === undefined ? {} : { profilePackageHash: profileManifest.contentHash }),
@@ -361,8 +347,4 @@ export function compositionDiff(
             ? undefined
             : { before: lastKnownGood.environment.stableValuesHash, after: current.environment.stableValuesHash },
     };
-}
-
-export function profileNameFromArgs(args: readonly string[]): string {
-    return profileFromArgs(args);
 }

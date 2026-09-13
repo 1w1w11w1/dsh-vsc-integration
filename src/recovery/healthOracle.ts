@@ -123,7 +123,8 @@ export class HealthOracle {
             while (true) {
                 controller.signal.throwIfAborted();
                 if (exited) {
-                    evidence.failureClass = launchError ? "launcher" : "boot-exit";
+                    const packageManagerError = wrapper && /(?:ERR_PNPM_|npm\s+(?:ERR!|error)\b)/iu.test(evidence.outputTail);
+                    evidence.failureClass = launchError || packageManagerError ? "launcher" : "boot-exit";
                     throw launchError ?? new Error("Recovery Runtime exited before becoming healthy");
                 }
                 if (endpoint) {

@@ -1,3 +1,4 @@
+import { isRecord } from "../guards";
 import { cp, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
@@ -54,6 +55,7 @@ function patchArgs(
     args: readonly string[],
     patchMap: ReadonlyMap<string, string>,
     allowedPaths: ReadonlySet<string>,
+    cwd: string,
 ): string[] {
     const result: string[] = [];
     for (let index = 0; index < args.length; index += 1) {
@@ -68,7 +70,7 @@ function patchArgs(
             inline = true;
         }
         if (source !== undefined) {
-            const key = normalized(source);
+            const key = normalized(resolve(cwd, source));
             if (!allowedPaths.has(key)) continue;
             const mapped = patchMap.get(key);
             if (!mapped) throw new SandboxBuildError(`Patch layer was not materialized: ${source}`);
@@ -122,21 +124,14 @@ async function rewriteProfileManifest(
     if (await exists(source)) {
         try {
             const parsed: unknown = JSON.parse(await readFile(source, "utf8"));
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                value = parsed as Record<string, unknown>;
-            }
+            if (isRecord(parsed)) value = parsed;
         } catch (error) {
             throw new SandboxBuildError(`Unable to parse profile manifest ${source}`, { cause: error });
         }
     }
     if (variant.bundleSelection !== undefined) {
-        const currentDsh = value.dsh && typeof value.dsh === "object" && !Array.isArray(value.dsh)
-            ? value.dsh as Record<string, unknown>
-            : {};
-        const currentProfile = currentDsh.profile && typeof currentDsh.profile === "object" &&
-            !Array.isArray(currentDsh.profile)
-            ? currentDsh.profile as Record<string, unknown>
-            : {};
+        const currentDsh = isRecord(value.dsh) ? value.dsh : {};
+        const currentProfile = isRecord(currentDsh.profile) ? currentDsh.profile : {};
         value.dsh = {
             ...currentDsh,
             profile: {
@@ -184,7 +179,8 @@ export class SandboxManager {
                 patchMap.set(normalized(source), target);
             }
 
-            const selectedBundles = variant.composition.bundles.filter((bundle) => bundle.selected);
+            const selectedBundles = variant.composition.bundles.filter(bundle =>
+                bundle.selected && bundle.origin !== "installation");
             for (const bundle of selectedBundles) {
                 if (!bundle.packageDir) {
                     throw new SandboxBuildError(`Bundle directory is unavailable: ${bundle.packageName}`);
@@ -208,7 +204,7 @@ export class SandboxManager {
             });
             const launch: RecoveryLaunchSpec = {
                 command: composition.binary.command,
-                args: patchArgs(composition.appArgs, patchMap, allowedPaths),
+                args: patchArgs(composition.appArgs, patchMap, allowedPaths, composition.environment.cwd),
                 cwd: workspace,
                 env,
                 source: composition.binary.source,

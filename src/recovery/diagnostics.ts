@@ -8,10 +8,6 @@ import type {
     RecoveryLedgerState,
 } from "./types";
 
-// Design 872 / 1063: 2 MB per generation, with the current generation never rotated away and
-// at least the last 32 KB always retained. The previous 240 KB was roughly 8x smaller than the
-// documented cap, so a chatty DSH boot lost its middle chunks — the part that usually carries
-// the crash evidence — long before the design expected any truncation.
 const MAX_BOOT_BYTES = 2 * 1024 * 1024;
 const MIN_TAIL_BYTES = 32 * 1024;
 
@@ -40,6 +36,11 @@ export function diagnosticValue(value: unknown, key = ""): unknown {
         ]));
     }
     return value;
+}
+
+function ignoreMissing(error: unknown): undefined {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return undefined;
 }
 
 function textBytes(value: string): number {
@@ -92,24 +93,28 @@ export class RecoveryDiagnostics {
             "",
         ].join("\n");
         let truncated = false;
+        let pending = Promise.resolve();
+        const enqueue = (write: () => Promise<void>): Promise<void> => {
+            pending = pending.then(write, write);
+            return pending;
+        };
         await writeFile(path, contents, { encoding: "utf8", mode: 0o600 });
         return {
             path,
-            append: async (stream, text) => {
+            append: (stream, text) => enqueue(async () => {
                 const safe = redactRecoveryText(text);
                 const line = `[${stream}] ${safe}\n`;
                 const next = keepBounded(`${contents}${line}`);
                 contents = next.value;
-                // Persist incrementally: if the extension dies during the boot, finish()
-                // never runs and the crash evidence must already be on disk (design 46, 466).
+                // Serialize appends and rewrites so finish cannot race an earlier write.
                 if (next.truncated) {
                     truncated = true;
                     await writeFile(path, contents, { encoding: "utf8", mode: 0o600 });
                 } else {
                     await appendFile(path, line, { encoding: "utf8", mode: 0o600 });
                 }
-            },
-            finish: async (summary) => {
+            }),
+            finish: (summary) => enqueue(async () => {
                 const tail = redactRecoveryText(summary.outputTail);
                 const summaryText = [
                     "",
@@ -131,7 +136,7 @@ export class RecoveryDiagnostics {
                 ].join("\n");
                 const next = keepBounded(`${contents}${summaryText}`);
                 await writeFile(path, next.value, { encoding: "utf8", mode: 0o600 });
-            },
+            }),
         };
     }
 
@@ -143,34 +148,22 @@ export class RecoveryDiagnostics {
         const exportId = `${new Date().toISOString().replace(/[:.]/gu, "-")}-${randomUUID().slice(0, 8)}`;
         const target = join(this.exportsDirectory, exportId);
         await mkdir(join(target, "logs"), { recursive: true });
-        await writeFile(
-            join(target, "manifest.json"),
-            `${JSON.stringify({
+        const documents = {
+            "manifest.json": {
                 schemaVersion: 1,
                 generatedAt: new Date().toISOString(),
                 sessionId: ledger.activeSessionId,
                 revision: ledger.revision,
-            }, null, 2)}\n`,
-            { encoding: "utf8", mode: 0o600 },
-        );
-        await writeFile(join(target, "ledger.json"), `${JSON.stringify(diagnosticValue(ledger), null, 2)}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-        });
-        await writeFile(join(target, "composition-current.json"), `${JSON.stringify(diagnosticValue(current ?? null), null, 2)}\n`, {
-            encoding: "utf8",
-            mode: 0o600,
-        });
-        await writeFile(
-            join(target, "composition-last-known-good.json"),
-            `${JSON.stringify(diagnosticValue(ledger.lastKnownGood ?? null), null, 2)}\n`,
-            { encoding: "utf8", mode: 0o600 },
-        );
-        await writeFile(
-            join(target, "composition-diff.json"),
-            `${JSON.stringify(diagnosticValue(compositionDiff(current, ledger.lastKnownGood)), null, 2)}\n`,
-            { encoding: "utf8", mode: 0o600 },
-        );
+            },
+            "ledger.json": ledger,
+            "composition-current.json": current ?? null,
+            "composition-last-known-good.json": ledger.lastKnownGood ?? null,
+            "composition-diff.json": compositionDiff(current, ledger.lastKnownGood),
+        };
+        for (const [name, value] of Object.entries(documents)) {
+            await writeFile(join(target, name), `${JSON.stringify(diagnosticValue(value), null, 2)}\n`,
+                { encoding: "utf8", mode: 0o600 });
+        }
         await writeFile(join(target, "conclusion.txt"), redactRecoveryText(corrupt?.message ??
             ledger.sessions.at(-1)?.error ?? ledger.sessions.at(-1)?.attribution?.humanSummary ?? "No recovery recorded."),
             { encoding: "utf8", mode: 0o600 });
@@ -184,43 +177,17 @@ export class RecoveryDiagnostics {
     }
 
     private async copyRecentLogs(target: string): Promise<void> {
-        const gone = (error: unknown): boolean => (error as NodeJS.ErrnoException).code === "ENOENT";
-        let sessions: string[] = [];
-        try {
-            sessions = (await readdir(this.logsDirectory, { withFileTypes: true }))
-                .filter((entry) => entry.isDirectory())
-                .map((entry) => entry.name);
-        } catch (error) {
-            if (!gone(error)) throw error;
-        }
-        // `rotate` deletes old session directories, so anything listed above can vanish
-        // before we stat or read it. Skip the disappeared entries instead of letting one
-        // of them reject and fail the whole export.
-        const dated: Array<{ name: string; time: number }> = [];
-        for (const name of sessions) {
-            try {
-                dated.push({ name, time: (await stat(join(this.logsDirectory, name))).mtimeMs });
-            } catch (error) {
-                if (!gone(error)) throw error;
-            }
-        }
-        const recent = dated.sort((a, b) => b.time - a.time).slice(0, 5).map(item => item.name);
-        for (const session of recent) {
+        const recent = (await this.recentSessions()).slice(0, 5);
+        for (const { name: session } of recent) {
             const files = await readdir(join(this.logsDirectory, session), { withFileTypes: true })
-                .catch((error: unknown) => {
-                    if (!gone(error)) throw error;
-                    return undefined;
-                });
+                .catch(ignoreMissing);
             if (!files) continue;
             const destination = join(target, "logs", basename(session));
             await mkdir(destination, { recursive: true });
             for (const file of files) {
                 if (!file.isFile() || !file.name.endsWith(".log")) continue;
                 const contents = await readFile(join(this.logsDirectory, session, file.name), "utf8")
-                    .catch((error: unknown) => {
-                        if (!gone(error)) throw error;
-                        return undefined;
-                    });
+                    .catch(ignoreMissing);
                 if (contents === undefined) continue;
                 await writeFile(join(destination, file.name), redactRecoveryText(contents),
                     { encoding: "utf8", mode: 0o600 });
@@ -228,11 +195,20 @@ export class RecoveryDiagnostics {
         }
     }
 
+    private async recentSessions(exclude?: string): Promise<Array<{ name: string; time: number }>> {
+        const entries = await readdir(this.logsDirectory, { withFileTypes: true }).catch(ignoreMissing) ?? [];
+        const dated: Array<{ name: string; time: number }> = [];
+        for (const entry of entries) {
+            if (!entry.isDirectory() || entry.name === exclude) continue;
+            // Rotation can remove a directory between listing and reading it.
+            const info = await stat(join(this.logsDirectory, entry.name)).catch(ignoreMissing);
+            if (info) dated.push({ name: entry.name, time: info.mtimeMs });
+        }
+        return dated.sort((a, b) => b.time - a.time);
+    }
+
     private async rotate(active: string): Promise<void> {
-        const entries = await readdir(this.logsDirectory, { withFileTypes: true });
-        const dated = await Promise.all(entries.filter(item => item.isDirectory() && item.name !== active)
-            .map(async item => ({ name: item.name, time: (await stat(join(this.logsDirectory, item.name))).mtimeMs })));
-        for (const item of dated.sort((a, b) => b.time - a.time).slice(4)) {
+        for (const item of (await this.recentSessions(active)).slice(4)) {
             await rm(join(this.logsDirectory, item.name), { recursive: true, force: true }).catch(() => undefined);
         }
     }

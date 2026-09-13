@@ -70,6 +70,11 @@ if (process.env.RECOVERY_VERIFY_MODE === "transient" &&
   process.exit(17);
 }
 
+if (process.env.RECOVERY_VERIFY_MODE === "launcher-policy") {
+  console.error("Error: ERR_PNPM_IGNORED_BUILDS");
+  process.exit(12);
+}
+
 const selected = bundles();
 // Only the fully-removed baseline is always healthy; the [good]-only set boots ONCE (so the
 // search finds a healthy candidate and apply() writes) and fails on the next boot, which is
@@ -150,9 +155,9 @@ server.listen(0, "127.0.0.1", () => {
         return { root, dshHome, profile, storage };
     };
 
-    const makeComposition = async (fixture, source) => buildComposition({
+    const makeComposition = async (fixture, source, launcherSource = "fixture") => buildComposition({
         command: process.execPath,
-        source: "fixture",
+        source: launcherSource,
         launcherArgs: [fixturePath],
         appArgs: [fixturePath],
         workspaceRoot: join(fixture.root, "workspace"),
@@ -160,7 +165,7 @@ server.listen(0, "127.0.0.1", () => {
         profile: "web",
     });
 
-    const runSession = async (fixture, source, mode) => {
+    const runSession = async (fixture, source, mode, options = {}) => {
         const diagnostics = new RecoveryDiagnostics(fixture.storage);
         const ledger = new RecoveryLedgerStore(fixture.storage);
         const fixes = new FixExecutor(ledger);
@@ -172,7 +177,8 @@ server.listen(0, "127.0.0.1", () => {
             },
         );
         const session = new RecoverySession({
-            maxBoots: 8,
+            maxBoots: options.maxBoots ?? 8,
+            onStatus: options.onStatus,
             oracle,
             ledger,
             fixes,
@@ -184,14 +190,18 @@ server.listen(0, "127.0.0.1", () => {
             delete process.env.RECOVERY_VERIFY_MODE;
             delete process.env.RECOVERY_VERIFY_MARKER;
         }
-        const composition = await makeComposition(fixture, source);
-        const outcome = await session.recover(composition, "fixture startup failed");
+        const composition = await makeComposition(fixture, source, options.launcherSource);
+        const outcome = await session.recover(composition, "fixture startup failed", options.signal);
+        for (const recorded of (await ledger.read()).state.sessions) {
+            assert.ok(recorded.budget.usedBoots <= recorded.budget.maxBoots, "every boot must fit the persisted budget");
+            assert.equal(recorded.budget.usedBoots, recorded.evidence.length, "every completed probe must be recorded");
+        }
         return { composition, outcome, diagnostics, fixes, ledger, session };
     };
 
     const bundleFixture = await makeFixture("bundle", ["@fixture/good", "@fixture/bad"]);
     const bundleRun = await runSession(bundleFixture, fixturePath);
-    assert.equal(bundleRun.outcome.status, "candidate", "bad bundle must produce a persisted candidate fix");
+    assert.equal(bundleRun.outcome.status, "candidate", `bad bundle must produce a persisted candidate fix: ${JSON.stringify(bundleRun.outcome)}`);
     assert.equal(bundleRun.outcome.fix?.kind, "disable-profile-bundles");
     assert.deepEqual(bundleRun.outcome.fix?.targetIds, ["@fixture/bad"]);
     const changedManifest = JSON.parse(await readFile(join(bundleFixture.profile, "package.json"), "utf8"));
@@ -219,6 +229,44 @@ server.listen(0, "127.0.0.1", () => {
     const restoredManifest = JSON.parse(await readFile(join(bundleFixture.profile, "package.json"), "utf8"));
     assert.deepEqual(restoredManifest.dsh.profile.bundles, ["@fixture/good", "@fixture/bad"]);
     console.log("PASS bad-bundle-auto-recover: sandbox boot, session/list, profile isolation, LKG, and restore");
+
+    const builtins = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app"];
+    const builtinFixture = await makeFixture("builtin", [...builtins, "@fixture/good", "@fixture/bad"]);
+    const builtinRun = await runSession(builtinFixture, fixturePath);
+    assert.equal(builtinRun.outcome.status, "candidate", "installation bundles need no profile-local package directory");
+    assert.deepEqual(builtinRun.outcome.fix.targetIds, ["@fixture/bad"]);
+    assert.deepEqual(JSON.parse(await readFile(join(builtinFixture.profile, "package.json"), "utf8"))
+        .dsh.profile.bundles, [...builtins, "@fixture/good"]);
+    await builtinRun.session.confirm(builtinRun.outcome.composition);
+    await builtinRun.fixes.restore();
+    console.log("PASS installation-bundles: shipped bundles survive isolation without local projection");
+
+    const launcherFixture = await makeFixture("launcher-policy", []);
+    const launcherRun = await runSession(launcherFixture, fixturePath, "launcher-policy", { launcherSource: "pnpm dlx" });
+    assert.equal(launcherRun.outcome.status, "unrecoverable");
+    const launcherEvidence = (await launcherRun.ledger.read()).state.sessions[0].evidence;
+    assert.equal(launcherEvidence.length, 1);
+    assert.equal(launcherEvidence[0].failureClass, "launcher");
+    console.log("PASS launcher-policy: package-manager failures stop before bundle isolation");
+
+    const limitedFixture = await makeFixture("limited", ["@fixture/good", "@fixture/bad"]);
+    const limitedRun = await runSession(limitedFixture, fixturePath, undefined, { maxBoots: 4 });
+    assert.equal(limitedRun.outcome.status, "unrecoverable");
+    assert.deepEqual(JSON.parse(await readFile(join(limitedFixture.profile, "package.json"), "utf8"))
+        .dsh.profile.bundles, ["@fixture/good", "@fixture/bad"]);
+    console.log("PASS budget: confirmation and verification cannot overrun the boot limit");
+
+    const cancelledFixture = await makeFixture("cancelled", ["@fixture/good", "@fixture/bad"]);
+    const abort = new AbortController();
+    const cancelledRun = await runSession(cancelledFixture, fixturePath, undefined, {
+        signal: abort.signal,
+        onStatus: status => { if (status.currentVariant?.endsWith("-verify")) abort.abort(); },
+    });
+    assert.equal(cancelledRun.outcome.status, "cancelled");
+    assert.deepEqual(JSON.parse(await readFile(join(cancelledFixture.profile, "package.json"), "utf8"))
+        .dsh.profile.bundles, ["@fixture/good", "@fixture/bad"]);
+    assert.equal((await cancelledRun.ledger.read()).state.entries.at(-1).status, "reverted");
+    console.log("PASS cancel-verification: cancellation rolls back the current manifest write");
 
     const transientFixture = await makeFixture("transient", []);
     const transientRun = await runSession(transientFixture, fixturePath, "transient");

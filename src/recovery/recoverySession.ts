@@ -1,5 +1,6 @@
-import { FixConflictError, FixExecutor } from "./fixExecutor";
-import { RecoveryLedgerStore } from "./ledger";
+import { randomUUID } from "node:crypto";
+import { FixExecutor } from "./fixExecutor";
+import { RecoveryLedgerCorruptError, RecoveryLedgerStore } from "./ledger";
 import { HealthOracle } from "./healthOracle";
 import { VariantEngine } from "./variantEngine";
 import type {
@@ -9,7 +10,6 @@ import type {
     CompositionVariant,
     FailureClass,
     HealthEvidence,
-    HealthVerdict,
     RecoveryBudget,
     RecoveryOutcome,
     RecoveryStatusView,
@@ -17,18 +17,8 @@ import type {
 
 const SAFE_MAX_BOOTS = 8;
 
-/**
- * Environment/launcher failures that design 7.2 says must terminate the search
- * instead of being attributed to a user bundle.
- */
+// Environment failures cannot establish bundle attribution.
 const TERMINAL_FAILURE_CLASSES = new Set<FailureClass>(["auth", "sandbox-build", "launcher"]);
-
-/**
- * Probe outcomes that prove nothing about the composition: the boot was cancelled,
- * timed out, or the sandbox itself failed. They must not be read as either direction
- * of a two-way confirmation.
- */
-const INCONCLUSIVE_VERDICTS = new Set<HealthVerdict>(["cancelled", "timeout", "sandbox-error"]);
 
 export interface RecoverySessionOptions {
     maxBoots?: number;
@@ -119,8 +109,12 @@ export class RecoverySession {
         this.controller = controller;
         const relay = (): void => controller.abort(signal?.reason);
         signal?.addEventListener("abort", relay, { once: true });
+        if (signal?.aborted) relay();
         let retainLease = false;
         this.running = this.run(composition, failureMessage, controller.signal)
+            .catch((error) => this.sessionId && controller.signal.aborted
+                ? this.cancelled(this.sessionId)
+                : this.unrecoverable(this.sessionId ?? "ledger-unavailable", String(error)))
             .then((outcome) => {
                 retainLease = outcome.status === "retry" || outcome.status === "candidate";
                 return outcome;
@@ -137,47 +131,27 @@ export class RecoverySession {
         return this.running;
     }
 
-    public async confirm(
-        composition: CompositionDescriptor,
+    public confirm(composition: CompositionDescriptor, attribution = this.attribution): Promise<void> {
+        return this.finish("recovered", attribution?.humanSummary ?? "Runtime recovered", composition, attribution);
+    }
+
+    public fail(message: string): Promise<void> {
+        return this.finish("unrecoverable", message);
+    }
+
+    private async finish(
+        phase: "recovered" | "unrecoverable",
+        summary: string,
+        composition?: CompositionDescriptor,
         attribution = this.attribution,
     ): Promise<void> {
         const sessionId = this.sessionId;
         if (!sessionId) return;
         try {
-            await this.options.ledger.finishSession(sessionId, "recovered", {
-                composition,
-                attribution,
+            await this.options.ledger.finishSession(sessionId, phase, {
+                composition, attribution, error: phase === "unrecoverable" ? summary : undefined,
             });
-            this.publish({
-                sessionId,
-                phase: "recovered",
-                usedBoots: this.status?.usedBoots ?? 0,
-                maxBoots: this.maxBoots,
-                summary: attribution?.humanSummary ?? "Runtime recovered",
-                canRestore: true,
-            });
-        } finally {
-            this.sessionId = undefined;
-            await this.options.ledger.releaseLease().catch(() => undefined);
-        }
-    }
-
-    public async fail(message: string): Promise<void> {
-        const sessionId = this.sessionId;
-        if (!sessionId) return;
-        try {
-            await this.options.ledger.finishSession(sessionId, "unrecoverable", {
-                attribution: this.attribution,
-                error: message,
-            });
-            this.publish({
-                sessionId,
-                phase: "unrecoverable",
-                usedBoots: this.status?.usedBoots ?? 0,
-                maxBoots: this.maxBoots,
-                summary: message,
-                canRestore: true,
-            });
+            this.publishTerminal(sessionId, phase, summary);
         } finally {
             this.sessionId = undefined;
             await this.options.ledger.releaseLease().catch(() => undefined);
@@ -198,223 +172,121 @@ export class RecoverySession {
         } catch (error) {
             return this.unrecoverable("recovery-busy", error instanceof Error ? error.message : String(error));
         }
-        let loaded;
-        try {
-            loaded = await this.options.ledger.read();
-        } catch (error) {
-            return this.unrecoverable(
-                "ledger-unavailable",
-                error instanceof Error ? error.message : String(error),
-            );
-        }
-        if (loaded.corrupt) {
-            this.options.onLog?.(`Recovery ledger is corrupt; automatic recovery stopped: ${loaded.corrupt.message}`);
-            await this.options.ledger.releaseLease().catch(() => undefined);
-            return {
-                status: "unrecoverable",
-                sessionId: "ledger-corrupt",
-                message: loaded.corrupt.message,
-            };
-        }
-
         let session;
         try {
             session = await this.options.ledger.beginSession(composition, budget, failureMessage);
         } catch (error) {
-            await this.options.ledger.releaseLease().catch(() => undefined);
+            if (error instanceof RecoveryLedgerCorruptError) {
+                this.options.onLog?.(`Recovery ledger is corrupt; automatic recovery stopped: ${error.message}`);
+                return { status: "unrecoverable", sessionId: "ledger-corrupt", message: error.message };
+            }
             return this.unrecoverable("ledger-unavailable", error instanceof Error ? error.message : String(error));
         }
         this.sessionId = session.id;
         this.publish({
             sessionId: session.id,
             phase: "detected",
-            usedBoots: 0,
+            usedBoots: session.budget.usedBoots,
             maxBoots: this.maxBoots,
             summary: failureMessage,
             canRestore: false,
         });
-        const evidence: import("./types").HealthEvidence[] = [];
-        for (const variant of variants) {
-            if (signal.aborted) return this.cancelled(session.id);
-            if (evidence.length >= this.maxBoots) break;
+        const evidence: HealthEvidence[] = [];
+        let usedBoots = session.budget.usedBoots;
+        const maxBoots = Math.min(this.maxBoots, session.budget.maxBoots);
+        const probe = async (variant: CompositionVariant, base = composition): Promise<HealthEvidence | undefined> => {
+            signal.throwIfAborted();
+            if (usedBoots >= maxBoots) return undefined;
+            await this.options.ledger.reserveBoot(session.id);
             this.publish({
-                sessionId: session.id,
-                phase: "searching",
-                usedBoots: evidence.length,
-                maxBoots: this.maxBoots,
-                currentVariant: variant.id,
-                summary: variant.assumption,
-                canRestore: false,
+                sessionId: session.id, phase: "searching", usedBoots: ++usedBoots, maxBoots,
+                currentVariant: variant.id, summary: variant.assumption, canRestore: false,
             });
-            const result = await this.options.oracle.evaluate(composition, variant, {
-                sessionId: session.id,
-                signal,
-            });
+            const result = await this.options.oracle.evaluate(base, variant, { sessionId: session.id, signal });
             evidence.push(result);
             await this.options.ledger.appendEvidence(session.id, result);
-            this.publish({
-                sessionId: session.id,
-                phase: "searching",
-                usedBoots: evidence.length,
-                maxBoots: this.maxBoots,
-                currentVariant: variant.id,
-                summary: `${variant.id}: ${result.verdict}`,
-                canRestore: false,
-            });
+            signal.throwIfAborted();
             if (result.cleanup.deferredCleanup) {
-                return this.unrecoverable(
-                    session.id,
-                    "Recovery stopped because process or sandbox cleanup could not be verified.",
-                );
+                throw new Error("Recovery stopped because process or sandbox cleanup could not be verified.");
             }
-            // Design 7.2: an auth / URL / version / sandbox-build failure is an environment
-            // problem, not a user bundle. Terminate rather than search, so an environment
-            // error can never be misattributed to a bundle and persisted as a profile fix.
-            if (variant.kind === "v1-reproduce" && TERMINAL_FAILURE_CLASSES.has(result.failureClass)) {
-                return this.unrecoverable(
-                    session.id,
-                    `Recovery stopped: the original composition failed as ${result.failureClass}, ` +
-                    "which is an environment or launcher problem rather than a user bundle.",
-                );
+            if (TERMINAL_FAILURE_CLASSES.has(result.failureClass)) {
+                throw new Error(`Recovery stopped: probe failed as ${result.failureClass}.`);
             }
-            if (variant.kind === "v1-reproduce" && result.verdict !== "healthy" && evidence.length < this.maxBoots) {
-                const retryVariant = {
-                    ...variant,
-                    id: `${variant.id}-retry`,
-                };
-                const retryResult = await this.options.oracle.evaluate(composition, retryVariant, {
-                    sessionId: session.id,
-                    signal,
-                });
-                evidence.push(retryResult);
-                await this.options.ledger.appendEvidence(session.id, retryResult);
-                if (retryResult.verdict === "healthy") {
-                    const attribution = this.variants.explain(retryVariant, evidence);
-                    this.attribution = attribution;
-                    return {
-                        status: "retry",
-                        sessionId: session.id,
-                        composition,
-                        ...(attribution === undefined ? {} : { attribution }),
-                        message: "The original composition passed the second recovery health probe.",
-                    };
-                }
+            return result;
+        };
+        for (const variant of variants) {
+            let result = await probe(variant);
+            if (!result) break;
+            if (variant.kind === "v1-reproduce" && result.verdict !== "healthy") {
+                result = await probe({ ...variant, id: `${variant.id}-retry` });
             }
-            if (result.verdict !== "healthy") continue;
-            const attribution = this.variants.explain(variant, evidence);
-            if (attribution) this.attribution = attribution;
-
+            if (!result || result.verdict !== "healthy") continue;
+            const attribution = this.variants.explain(
+                { ...variant, id: result.variantId }, evidence,
+            );
             if (variant.kind === "v1-reproduce") {
+                this.attribution = attribution;
                 return {
-                    status: "retry",
-                    sessionId: session.id,
-                    composition,
-                    ...(attribution === undefined ? {} : { attribution }),
+                    status: "retry", sessionId: session.id, composition, attribution,
                     message: "The original composition passed the recovery health probe.",
                 };
             }
             const candidate = variant.candidateFix;
             if (!candidate) continue;
             if (candidate.kind === "disable-profile-bundles") {
-                // Design 7.3 step 5 requires both directions: removing the candidate set
-                // passes (the healthy variant found above) and re-adding *only* the
-                // candidate set fails with a compatible failure class. Without the re-add
-                // direction the monotonicity assumption is never falsified, and persisting
-                // the fix would edit the user's profile on an unfounded attribution.
+                if (this.options.allowBundleIsolation?.() === false) continue;
+                // Reserve both the re-add confirmation and the post-write probe.
+                if (usedBoots + 2 > maxBoots) continue;
                 const readd = this.variants.readdConfirmation(composition, candidate.targetIds);
-                const confirmation = await this.options.oracle.evaluate(
-                    readd.composition,
-                    readd,
-                    { sessionId: session.id, signal },
-                );
-                evidence.push(confirmation);
-                await this.options.ledger.appendEvidence(session.id, confirmation);
-                if (confirmation.cleanup.deferredCleanup) continue;
-                // An inconclusive probe must never count as the "re-add fails" direction:
-                // a cancelled/timed-out/sandbox-failed boot is not evidence that the bundle
-                // is the culprit, and treating it as one would confirm an unfounded attribution.
-                if (INCONCLUSIVE_VERDICTS.has(confirmation.verdict)) {
-                    this.options.onLog?.(
-                        `Re-add confirmation for ${candidate.targetIds.join(", ")} was inconclusive; the attribution is not confirmed.`,
-                    );
-                    continue;
-                }
-                const original = evidence.find((item) => item.verdict !== "healthy");
-                if (confirmation.verdict === "healthy") {
-                    this.options.onLog?.(
-                        `Candidate ${candidate.targetIds.join(", ")} stayed healthy when re-added; the attribution is not confirmed.`,
-                    );
-                    continue;
-                }
-                if (original && confirmation.failureClass !== original.failureClass) {
-                    this.options.onLog?.(
-                        `Re-add confirmation failed as ${confirmation.failureClass}, incompatible with the original ${original.failureClass}; the attribution is not confirmed.`,
-                    );
+                const original = evidence.find(item => item.verdict === "process-error");
+                const confirmation = await probe(readd, readd.composition);
+                if (!confirmation || confirmation.verdict !== "process-error" ||
+                    !original || confirmation.failureClass !== original.failureClass) {
+                    this.options.onLog?.(`Bundle attribution was not confirmed: ${candidate.targetIds.join(", ")}`);
                     continue;
                 }
             }
-            if (
-                candidate.kind === "disable-profile-bundles" &&
-                this.options.allowBundleIsolation &&
-                !this.options.allowBundleIsolation()
-            ) {
-                this.options.onLog?.("Automatic profile bundle isolation is disabled by configuration.");
-                continue;
-            }
-            const fix = {
+            if (usedBoots >= maxBoots) continue;
+            const fix: CandidateFix = {
                 ...candidate,
-                evidenceBootIds: [...candidate.evidenceBootIds, result.bootId],
+                id: `${candidate.id}-${randomUUID()}`,
+                evidenceBootIds: evidence.map(item => item.bootId),
             };
+            let applied = false;
             try {
+                signal.throwIfAborted();
                 await this.options.ledger.planFix(session.id, fix, composition.compositionHash);
                 const changed = await this.options.fixes.apply(fix, composition);
-                // Design 794-795: before handing the real manifest back to a real start,
-                // re-verify in the sandbox that the file we just wrote actually boots. Without
-                // this, a bad write is only discovered by a real boot, and that failure path
-                // marks the session unrecoverable without ever restoring the original file —
-                // leaving the user's profile broken until they run restore by hand.
-                // The file has already been written, so record it as applied BEFORE verifying:
-                // restore() only reverts entries in the applied/verified state, and marking it
-                // after verification would leave a rejected fix as `planned` and therefore
-                // unrevertable — the write would silently survive the rollback.
+                applied = true;
                 await this.options.ledger.markFixApplied(session.id, fix.id, changed.compositionHash);
-                const verified = await this.verifyAppliedFix(fix, changed);
-                if (!verified.ok) {
-                    await this.options.fixes.restore();
-                    await this.options.ledger.markFixConflict(session.id, fix.id, verified.reason);
-                    this.options.onLog?.(`Recovery fix was rolled back: ${verified.reason}`);
-                    continue;
-                }
+                const verified = await probe({
+                    id: `${fix.id}-verify`, kind: variant.kind,
+                    parentHash: changed.compositionHash,
+                    assumption: "Verify the applied recovery change.",
+                    composition: changed,
+                }, changed);
+                if (verified?.verdict !== "healthy") throw new Error("The applied recovery change did not pass its health probe.");
+                this.attribution = attribution;
                 this.publish({
-                    sessionId: session.id,
-                    phase: "fix-applied",
-                    usedBoots: evidence.length,
-                    maxBoots: this.maxBoots,
+                    sessionId: session.id, phase: "fix-applied", usedBoots, maxBoots,
                     currentVariant: variant.id,
-                    summary: attribution?.humanSummary ?? fix.reason,
-                    canRestore: true,
+                    summary: attribution?.humanSummary ?? fix.reason, canRestore: true,
                 });
                 return {
-                    status: "candidate",
-                    sessionId: session.id,
-                    composition: changed,
-                    fix,
-                    ...(attribution === undefined ? {} : { attribution }),
-                    message: fix.reason,
+                    status: "candidate", sessionId: session.id, composition: changed,
+                    fix, attribution, message: fix.reason,
                 };
             } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                await this.options.ledger.markFixConflict(session.id, fix.id, message);
-                if (error instanceof FixConflictError) {
-                    this.options.onLog?.(`Recovery fix was rejected: ${message}`);
-                } else {
-                    this.options.onLog?.(`Recovery fix failed: ${message}`);
-                }
+                // Roll back only this attempt, retaining the lease and older verified fixes.
+                if (applied) await this.options.fixes.rollback(fix.id);
+                else await this.options.ledger.markFixConflict(session.id, fix.id, String(error));
+                this.options.onLog?.(`Recovery fix rejected: ${String(error)}`);
+                if (applied) throw error;
             }
         }
         const message = signal.aborted
             ? "Recovery was cancelled"
-            : `Recovery exhausted its ${this.maxBoots}-boot budget without a verified fix.`;
+            : `Recovery found no verified fix after ${usedBoots} of ${maxBoots} allowed boots.`;
         return signal.aborted ? this.cancelled(session.id) : this.unrecoverable(session.id, message);
     }
 
@@ -422,10 +294,7 @@ export class RecoverySession {
         return {
             maxBoots: this.maxBoots,
             usedBoots: 0,
-            // Design 7.1: V1 and V4 are single shots, confirmation is one more, and V3 gets
-            // `1 + ceil(log2(n)) + 1` — the all-removed baseline, the bisection steps and the
-            // re-add confirmation. The V3 figure depends on the user's bundle count, so the
-            // planner computes it once it knows n (see VariantEngine.plan).
+            // Bundle reservations depend on the composition and are filled by the planner.
             reserved: { v1: 1, v3: 0, v4: 1, confirmation: 1 },
             skipped: [],
         };
@@ -436,14 +305,7 @@ export class RecoverySession {
             attribution: this.attribution,
             error: "Recovery was cancelled",
         });
-        this.publish({
-            sessionId,
-            phase: "cancelled",
-            usedBoots: this.status?.usedBoots ?? 0,
-            maxBoots: this.maxBoots,
-            summary: "Recovery was cancelled",
-            canRestore: true,
-        });
+        this.publishTerminal(sessionId, "cancelled", "Recovery was cancelled");
         return { status: "cancelled", sessionId, message: "Recovery was cancelled" };
     }
 
@@ -462,14 +324,7 @@ export class RecoverySession {
                 this.options.onLog?.(`Failed to finalize recovery ledger: ${String(error)}`);
             }
         }
-        this.publish({
-            sessionId,
-            phase: "unrecoverable",
-            usedBoots: this.status?.usedBoots ?? 0,
-            maxBoots: this.maxBoots,
-            summary: message,
-            canRestore: true,
-        });
+        this.publishTerminal(sessionId, "unrecoverable", message);
         return {
             status: "unrecoverable",
             sessionId,
@@ -478,33 +333,18 @@ export class RecoverySession {
         };
     }
 
-    /**
-     * Design 794-795: after `apply` rewrites the real profile manifest, boot the changed
-     * composition in the sandbox before any real start. A failure here means the write we just
-     * made is not bootable, so the caller rolls it back instead of leaving the user's profile
-     * broken. Returns a reason rather than throwing so the caller keeps the ledger in charge.
-     */
-    private async verifyAppliedFix(
-        fix: CandidateFix,
-        changed: CompositionDescriptor,
-    ): Promise<{ ok: true; } | { ok: false; reason: string; }> {
-        const variant: CompositionVariant = {
-            id: `${fix.id}-verify`,
-            kind: "v3-bundle-singleton",
-            parentHash: changed.compositionHash,
-            assumption: "Re-verify the profile manifest written by this fix in the sandbox.",
-            bundleSelection: changed.bundles.filter((bundle) => bundle.selected).map((bundle) => bundle.packageName),
-            composition: changed,
-        };
-        const canary = await this.options.oracle.evaluate(changed, variant, { sessionId: this.status?.sessionId ?? "" });
-        if (canary.cleanup.deferredCleanup) {
-            return { ok: false, reason: "Sandbox cleanup could not be verified after writing the profile manifest." };
-        }
-        if (canary.verdict !== "healthy") {
-            return { ok: false, reason: `The manifest written by this fix does not boot: ${canary.failureClass ?? "unknown failure"}.` };
-        }
-        return { ok: true };
+    private publishTerminal(
+        sessionId: string,
+        phase: "recovered" | "unrecoverable" | "cancelled",
+        summary: string,
+    ): void {
+        this.publish({
+            sessionId, phase, summary, canRestore: true,
+            usedBoots: this.status?.usedBoots ?? 0,
+            maxBoots: this.maxBoots,
+        });
     }
+
     private publish(status: RecoveryStatusView): void {
         this.status = { ...status };
         this.options.onStatus?.({ ...status });

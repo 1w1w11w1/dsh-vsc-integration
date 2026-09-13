@@ -1,3 +1,4 @@
+import { isRecord } from "../guards";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -86,6 +87,7 @@ export class FixExecutor {
 
         const manifestPath = fix.profileManifestPath;
         if (!manifestPath) throw new FixConflictError("Recovery bundle fix has no profile manifest");
+        await assertRegularFile(manifestPath);
         const original = await readFile(manifestPath, "utf8");
         const beforeHash = sha256(original);
         if (fix.expectedProfileManifestHash && beforeHash !== fix.expectedProfileManifestHash) {
@@ -94,8 +96,8 @@ export class FixExecutor {
         let parsed: Record<string, unknown>;
         try {
             const value: unknown = JSON.parse(original);
-            if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("root is not an object");
-            parsed = value as Record<string, unknown>;
+            if (!isRecord(value)) throw new Error("root is not an object");
+            parsed = value;
         } catch (error) {
             throw new FixConflictError(`Profile manifest is invalid JSON: ${String(error)}`);
         }
@@ -121,6 +123,11 @@ export class FixExecutor {
             beforeHash, afterHash, original,
         };
         await atomicWrite(join(this.backupsDirectory, `${fix.id}.json`), `${JSON.stringify(backup, null, 2)}\n`);
+        await this.ledger.assertLease();
+        if (sha256(await readFile(manifestPath, "utf8")) !== beforeHash) {
+            throw new FixConflictError(`Profile manifest changed during recovery: ${manifestPath}`);
+        }
+        await assertRegularFile(manifestPath);
         await atomicWrite(manifestPath, nextContents);
         this.output?.appendLine(`[dsh:recovery] applied ${fix.id} to ${manifestPath}`);
         return recomputeComposition(composition, {
@@ -134,48 +141,47 @@ export class FixExecutor {
     public async restore(): Promise<string[]> {
         await this.ledger.acquireLease();
         try {
-            const entries = (await this.ledger.readEntries()).filter(entry =>
-                entry.status === "applied" || entry.status === "verified");
-            const restored: string[] = [];
-            const conflicts: string[] = [];
-            for (const entry of [...entries].reverse()) {
-                if (entry.fix.kind === "remove-extension-overlay") {
-                    await this.ledger.restoreEntry(entry.id);
-                    restored.push(entry.id);
-                    continue;
-                }
-                // The whole revert is the per-entry attempt, not just the backup read: every
-                // step after this point touches the user's file (read the target, check it is a
-                // regular file, write it back, record the ledger transition). If any of them
-                // throws — a deleted/renamed manifest, a backup that cannot be read, a target
-                // replaced by a symlink — the entry must still be recorded as conflicted and the
-                // remaining entries must still be attempted. Letting a throw escape would strand
-                // every earlier entry as "applied" with no record of why, and would hide the
-                // entries that were already reverted.
-                try {
-                    const backup = await this.readBackup(entry);
-                    const current = await readFile(backup.target, "utf8");
-                    if (sha256(current) !== backup.afterHash) {
-                        throw new FixConflictError(`Profile manifest changed after recovery: ${backup.target}`);
-                    }
-                    await assertRegularFile(backup.target);
-                    await atomicWrite(backup.target, backup.original);
-                    await this.ledger.restoreEntry(entry.id);
-                    restored.push(entry.id);
-                } catch (error) {
-                    const message = error instanceof Error ? error.message : String(error);
-                    await this.ledger.restoreEntry(entry.id, "conflicted", message);
-                    conflicts.push(message);
-                }
-            }
-            // Entries are processed in reverse, so bailing out on the first conflict would
-            // leave a partial restore that the caller never hears about. Report the whole
-            // outcome instead, carrying the list of entries that were actually reverted.
-            if (conflicts.length) throw new FixConflictError(conflicts.join("; "), restored);
-            return restored;
+            return await this.restoreEntries((await this.ledger.readEntries()).filter(entry =>
+                entry.status === "applied" || entry.status === "verified"));
         } finally {
             await this.ledger.releaseLease().catch(() => undefined);
         }
+    }
+
+    public async rollback(fixId: string): Promise<void> {
+        await this.ledger.assertLease();
+        const entry = (await this.ledger.readEntries()).find(entry => entry.id === fixId);
+        if (!entry) throw new FixConflictError(`Recovery fix ${fixId} does not exist`);
+        await this.restoreEntries([entry]);
+    }
+
+    private async restoreEntries(entries: RecoveryLedgerEntry[]): Promise<string[]> {
+        const restored: string[] = [];
+        const conflicts: string[] = [];
+        for (const entry of [...entries].reverse()) {
+            if (entry.fix.kind === "remove-extension-overlay") {
+                await this.ledger.restoreEntry(entry.id);
+                restored.push(entry.id);
+                continue;
+            }
+            try {
+                const backup = await this.readBackup(entry);
+                const current = await readFile(backup.target, "utf8");
+                if (sha256(current) !== backup.afterHash) {
+                    throw new FixConflictError(`Profile manifest changed after recovery: ${backup.target}`);
+                }
+                await assertRegularFile(backup.target);
+                await atomicWrite(backup.target, backup.original);
+                await this.ledger.restoreEntry(entry.id);
+                restored.push(entry.id);
+            } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                await this.ledger.restoreEntry(entry.id, "conflicted", message);
+                conflicts.push(message);
+            }
+        }
+        if (conflicts.length) throw new FixConflictError(conflicts.join("; "), restored);
+        return restored;
     }
 
     private async readBackup(entry: RecoveryLedgerEntry): Promise<Backup> {
@@ -194,10 +200,6 @@ export class FixExecutor {
             throw new FixConflictError(`Recovery backup is unavailable for ${entry.id}: ${String(error)}`);
         }
     }
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-    return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 async function assertRegularFile(path: string): Promise<void> {
