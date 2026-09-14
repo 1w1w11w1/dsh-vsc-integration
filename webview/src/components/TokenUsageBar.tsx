@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { TokenUsageView } from "../../../src/types";
 import { numberFormatter, t } from "../i18n";
 import { postAction } from "../bridge";
@@ -84,8 +84,35 @@ function ChartRow({
 export function TokenUsageBar({ usage }: TokenUsageBarProps): React.JSX.Element | null {
     const [hovered, setHovered] = useState(false);
     const [focused, setFocused] = useState(false);
+    const anchorRef = useRef<HTMLDivElement>(null);
+    const panelRef = useRef<HTMLDivElement>(null);
+    const [panelLeft, setPanelLeft] = useState(0);
 
     const open = hovered || focused;
+
+    useLayoutEffect(() => {
+        if (!open || !usage) return;
+        const anchor = anchorRef.current;
+        const panel = panelRef.current;
+        if (!anchor || !panel) return;
+        const position = (): void => {
+            const bounds = anchor.getBoundingClientRect();
+            const margin = 8;
+            const rightmost = Math.max(margin, document.documentElement.clientWidth - panel.offsetWidth - margin);
+            const left = Math.max(margin, Math.min(bounds.left, rightmost));
+            setPanelLeft(left - bounds.left);
+        };
+        position();
+        const observer = new ResizeObserver(position);
+        observer.observe(panel);
+        // Footer chips can move the anchor without changing its own size.
+        if (anchor.parentElement?.parentElement) observer.observe(anchor.parentElement.parentElement);
+        window.addEventListener("resize", position);
+        return () => {
+            observer.disconnect();
+            window.removeEventListener("resize", position);
+        };
+    }, [open, usage]);
 
     useEffect(() => {
         if (!open) return;
@@ -140,6 +167,7 @@ export function TokenUsageBar({ usage }: TokenUsageBarProps): React.JSX.Element 
         <section className="dsh-usage" aria-label={t("Token and context usage")}>
             <div
                 className="dsh-usage-context"
+                ref={anchorRef}
                 onMouseEnter={() => setHovered(true)}
                 onMouseLeave={() => setHovered(false)}
                 onFocus={() => setFocused(true)}
@@ -166,6 +194,8 @@ export function TokenUsageBar({ usage }: TokenUsageBarProps): React.JSX.Element 
                     <div
                         id="dsh-context-breakdown"
                         className="dsh-usage-panel"
+                        ref={panelRef}
+                        style={{ left: panelLeft }}
                         role="dialog"
                         aria-label={t("Token statistics")}
                     >

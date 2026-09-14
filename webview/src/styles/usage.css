@@ -134,12 +134,11 @@
     font-variant-numeric: tabular-nums;
 }
 
-/* Rises from the context ring in the composer footer. Anchored to the ring's
-   right edge with a capped width so it stays a self-contained popover rather
-   than the old full-width strip. */
+/* Rises from the context ring; the component clamps its horizontal position
+   to the webview viewport, including when footer chips move the trigger. */
 .dsh-usage-panel {
     position: absolute;
-    right: 0;
+    left: 0;
     /* Touch the trigger so the pointer can travel from the ring into the
        hover panel without crossing a gap that would dismiss it. */
     bottom: 100%;
