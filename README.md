@@ -107,13 +107,17 @@ The bottom bar shows your current balance, including peak and off-peak pricing. 
 
 **Do I need to install DSH manually?** Usually no. The extension looks for a usable local environment and attempts to download a managed Runtime when needed. The first download requires network access; `dsh.installWhenMissing` controls automatic installation.
 
-**Can I connect to an existing Runtime?** Yes. Set `dsh.serverUrl` to your running `dsh web` address and set `dsh.serverToken` to its launch token when the token is not already in the URL. This extension targets `dsh 0.1.5-rc.1`, including its V3 history and opt-in Assistant stream. Upgrade manually managed instances too: older RC releases do not provide the required stream contract. Newer releases require another contract audit. Session migration preserves original logs, but older runtimes cannot read the upgraded V3 files.
+**Can I connect to an existing Runtime?** Yes. Set `dsh.serverUrl` to your running `dsh web` address and set `dsh.serverToken` to its launch token when the token is not already in the URL. This extension accepts valid SemVer versions at or above `dsh 0.1.5-rc.1`, including newer prereleases and stable versions. RC.1 remains the default download and upgrade target. V3 history and opt-in Assistant streams remain required. Session migration preserves original logs, but older runtimes cannot read the upgraded V3 files.
 
-The default `dsh.command: "auto"` probes `dsh --version` on PATH, then in the npm global prefix. A compatible local CLI is used directly; missing, unknown or incompatible versions fall back to pnpm/npx pinned to `0.1.5-rc.1`, then the managed Runtime. Currently only that exact version is accepted, not arbitrary newer releases. Discovery does not upgrade or overwrite a global installation. Explicit executable paths remain authoritative and fail on incompatible versions; explicit pnpm/npx retains package-manager startup. If you previously saved `dsh.command: "pnpm"`, reset it or select `auto` to enable local-first discovery.
+The source audit covers upstream master `c291e7961a` and release tag `dsh-v0.1.5-rc.2` (`fb2c4b9e698e30edb738bca4cf0618587db7d203`). Message feedback preserves categories for both ratings, including edits and conflict responses. When a Runtime supplies master’s optional `modeSelectionEnabled` policy, disabling it hides the IDE mode choices, clears a staged mode, and restores blank sessions to the effective default before their first prompt; started sessions keep their composition. Skill completion tooltips show `SKILL.md` paths when supplied. Missing optional fields retain RC.2 behavior. Version acceptance follows the minimum-version rule, independently of this source audit.
+
+At this audit, npm `latest` still points to RC.1; RC.2 is published under `next`. The extension keeps `0.1.5-rc.1` as its default; a compatible RC.2 local installation is reused without downgrading.
+
+The default `dsh.command: "auto"` probes `dsh --version` on PATH, then in the npm global prefix. A compatible local CLI is used directly. An incompatible CLI gets an upgrade prompt before any plugin download: it shows the current version, target and installation path. Approval upgrades a verified older npm global installation to `dsh.runtimeVersion`, then probes that same CLI again. Declining or closing the prompt uses pinned pnpm, then npx, then the managed CNB Runtime; missing CLIs also use this fallback. Upgrade failure offers fallback or cancellation. Unknown versions and older installations outside the active npm prefix get manual guidance. Diagnostics never prompt or install. Explicit local paths follow the same upgrade flow; explicit pnpm/npx keeps package-manager startup. If you previously saved `dsh.command: "pnpm"`, reset it or select `auto` to enable local-first discovery.
 
 Default app arguments are `web --no-open`; pnpm/npx gets its required prefix automatically when no argument override is saved. Existing package-manager argument overrides are preserved, and auto mode strips their package prefix when selecting a local CLI. Shared Runtime discovery and lock migration still run before choosing a new launcher, so fallback cannot bypass an occupied lock.
 
-As of the adaptation check, the CNB standalone Runtime mirror returns 404 for `0.1.5-rc.1`. Use a compatible local CLI, the pinned pnpm/npx fallback, or an existing instance until that mirror is published; a standalone download is not currently verified. After compilation, `node scripts/verify-runtime-discovery.mjs` checks selection and actual startup arguments in an isolated POSIX CLI environment without downloads or model requests.
+As of the adaptation check, the CNB standalone Runtime mirror returns 404 for `0.1.5-rc.2`. Use a compatible local CLI, the pinned pnpm/npx fallback, or an existing instance until that mirror is published; a standalone download is not currently verified. After compilation, `node scripts/verify-runtime-discovery.mjs` checks selection and actual startup arguments in an isolated POSIX CLI environment without downloads or model requests.
 
 **Does DSH support multi-root workspaces?** DSH supports multiple independent Workspaces, but each Session has one working directory (`cwd`). A VS Code multi-root workspace is therefore represented by the first workspace folder for Runtime startup; use separate DSH Workspaces or Sessions when roots need different working directories.
 
@@ -129,7 +133,7 @@ The extension connects to the Runtime through RC Remote RPC, using HTTP calls an
 
 Multiple VS Code windows preferentially reuse the same local Harness Runtime. The Runtime launched by the extension publishes a random loopback port through a process lock; later windows connect directly, avoiding competing writes.
 
-The shared file remains `dsh-runtime.lock` in the OS temporary directory. Its contents include `runtimeVersion`, owner `pid` / `ownerId` / `createdAt`, launcher `runtimePid` / `runtimeProcess`, the owned POSIX `runtimeProcessGroup`, and connection addresses. The version comes from an exact npm package spec, the managed version, or the local launcher's `--version`, never an assumed default for an unknown binary. Automatic reuse requires an exact match to this extension's target. Unversioned or mismatched live instances enter the migration flow below; automatic port discovery without a versioned lock is rejected. Explicit `dsh.serverUrl` connections remain the operator's responsibility for version compatibility.
+The shared file remains `dsh-runtime.lock` in the OS temporary directory. Its contents include `runtimeVersion`, owner `pid` / `ownerId` / `createdAt`, launcher `runtimePid` / `runtimeProcess`, the owned POSIX `runtimeProcessGroup`, and connection addresses. The version comes from an exact npm package spec, the managed version, or the local launcher's `--version`, never an assumed default for an unknown binary. Automatic reuse accepts versions at or above the minimum and retains the actual detected version. Unversioned or too-old live instances enter the migration flow below; automatic port discovery without a versioned lock is rejected. Explicit `dsh.serverUrl` connections remain the operator's responsibility for version compatibility.
 
 Lock cleanup rules:
 
@@ -159,7 +163,7 @@ Search `dsh` in VS Code settings for the full list.
 | `dsh.serverToken` | `""` | Launch token for `dsh.serverUrl`; use it when the address and token are configured separately. |
 | `dsh.autoStart` | `true` | Automatically start or connect to dsh web when the extension activates. |
 | `dsh.installWhenMissing` | `true` | Automatically download and manage a standalone Runtime when no usable npm/dsh environment is available. |
-| `dsh.runtimeVersion` | `0.1.5-rc.1` | Version to download for the managed Runtime (requires that version on the CNB mirror). |
+| `dsh.runtimeVersion` | `0.1.5-rc.1` | Approved CLI upgrade and plugin download target; accepts any valid SemVer at or above RC.1 (CNB downloads require a published mirror). |
 | `dsh.npmRegistry` | `https://registry.npmmirror.com` | Registry mirror used as a download fallback. |
 | `dsh.npxTimeoutMs` | `120000` | Timeout while waiting for package-manager download and startup. |
 | `dsh.maxContextBytes` | `120000` | Maximum UTF-8 bytes of `<ide_context>` included per prompt. |
@@ -224,7 +228,7 @@ npm run package    # Compile + vsce package
 npm run release    # Test + version bump + CHANGELOG archive + tag
 ```
 
-To check the Remote integration against an installed `0.1.5-rc.1` launcher:
+To check the Remote integration against an installed `0.1.5-rc.2` launcher:
 
 ```bash
 npm run compile

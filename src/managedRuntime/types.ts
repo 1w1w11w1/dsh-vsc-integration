@@ -1,3 +1,5 @@
+import { compareRuntimeVersions } from "../runtimeVersion";
+
 /**
  * Managed (self-installed) DSH Runtime support.
  *
@@ -63,6 +65,14 @@ export interface RuntimeDownloadProvider {
 
 /** Pinned runtime version; never request "latest" from a remote manifest. */
 export const RUNTIME_DEFAULT_VERSION = "0.1.5-rc.1";
+
+/** Minimum CLI/Remote version. Newer SemVer releases are accepted without changing the download default. */
+export const RUNTIME_MINIMUM_VERSION = "0.1.5-rc.1";
+
+export function isSupportedRuntimeVersion(version: string | undefined): version is string {
+    const order = compareRuntimeVersions(version, RUNTIME_MINIMUM_VERSION);
+    return order !== undefined && order >= 0;
+}
 
 /** Download source for the first version; reserved for a future GitHub provider. */
 export const RUNTIME_DOWNLOAD_SOURCE = "cnb" as const;
