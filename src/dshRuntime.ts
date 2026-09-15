@@ -104,6 +104,7 @@ import {
     normalizeDynamicPluginStopResult,
 } from "./dynamicPlugins";
 import { normalizePluginInventory } from "./pluginInventory";
+import type { DshPromptFilePart } from "./fileUpload";
 import { samePath } from "./paths";
 
 type RuntimeListener = (status: RuntimeStatus) => void;
@@ -1751,6 +1752,7 @@ export class DshRuntime implements vscode.Disposable {
         mode: "queue" | "steer" = "queue",
         images: readonly DshImageUpload[] = [],
         requestId: string = randomUUID(),
+        files: readonly DshPromptFilePart[] = [],
     ): Promise<DshSessionPromptResult> {
         return this.apiClient.call("session/prompt", {
             request: {
@@ -1764,6 +1766,10 @@ export class DshRuntime implements vscode.Disposable {
                         mediaType: image.mediaType,
                         data: image.data,
                         ...(image.name === undefined ? {} : { name: image.name }),
+                    })),
+                    ...files.map((file) => ({
+                        type: "file" as const,
+                        receiptId: file.receiptId,
                     })),
                 ],
                 ...(Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -2900,17 +2906,6 @@ export class DshRuntime implements vscode.Disposable {
         return this.authCookie === undefined ? {} : { cookie: this.authCookie };
     }
 
-    /**
-     * Harness home of the Runtime this extension talks to.
-     *
-     * Only trustworthy for a Runtime this extension launched, so callers that
-     * derive paths from it must treat an unknown value as "cannot say" rather
-     * than falling back to a path that may belong to someone else's instance.
-     */
-    public getDshHome(): string | undefined {
-        if (!this.startedByExtension) return undefined;
-        return process.env.DSH_HOME || join(homedir(), ".dsh");
-    }
 
     private clearRuntimeAuthentication(): void {
         this.authCookie = undefined;

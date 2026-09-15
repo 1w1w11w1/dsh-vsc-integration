@@ -39,8 +39,7 @@ import {
 } from "./codeBlockActions";
 import { MarkdownRenderCache } from "./markdownRenderCache";
 import { samePath } from "./paths";
-import { DshFileUploads, DshPromptFile } from "./fileUpload";
-import { escapeContextAttribute } from "./contextStore";
+import { DshFileUploads, DshPromptFilePart } from "./fileUpload";
 import { presentSessionRows } from "./sessionCatalog";
 import { SessionCatalogCache } from "./sessionCatalogCache";
 import { listPromptTemplates, readPromptTemplate } from "./promptTemplates";
@@ -339,7 +338,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.fileUploads = new DshFileUploads({
             baseUrl: () => runtime.getUrl(),
             requestHeaders: () => runtime.requestHeaders(),
-            dshHome: () => runtime.getDshHome(),
             maxBytes: () => this.fileUploadLimits().maxUploadBytes,
         });
         this.goalActivation = new GoalActivationController(
@@ -1640,10 +1638,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
                 throw new Error(t("@selection has no current selection. Select text in the active editor first."));
             }
             const uploadedFiles = await this.uploadPromptFiles(session, requestedFiles);
-            const withContext = capture.text ? `${promptText}\n\n${capture.text}` : promptText;
-            const prompt = uploadedFiles.text
-                ? `${withContext}\n\n${uploadedFiles.text}`
-                : withContext;
+            const prompt = capture.text ? `${promptText}\n\n${capture.text}` : promptText;
             let limits = imageLimitsProjection(
                 this.runtime.getSessionStore().get(session)?.projections
                     .find((cell) => cell.key === "imageLimits")?.value,
@@ -1682,6 +1677,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
                 mode,
                 prepared.uploads,
                 optimistic.requestId,
+                uploadedFiles,
             );
             if (promptResult.accepted === false) {
                 throw new Error(t("The dsh runtime rejected this prompt. Check the current model and API Key configuration."));
@@ -1728,12 +1724,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             );
             const result = await this.runtime.prompt(
                 this.sessionId,
-                replayed.text
-                    ? `${optimistic.wireText}\n\n${replayed.text}`
-                    : optimistic.wireText,
+                optimistic.wireText,
                 "queue",
                 optimistic.imageUploads ?? [],
                 optimistic.requestId,
+                replayed,
             );
             if (result.accepted === false) throw new Error(t("The dsh runtime rejected this retry."));
         } catch (error) {
@@ -2893,11 +2888,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
 
     /**
-     * Upload every drafted file and render the block that names them.
+     * Upload every drafted file for one send and return the receipts a prompt
+     * cites.
      *
-     * The Runtime stores each file and answers with an opaque receipt, so the
-     * prompt is given the stored path instead: the receipt never reaches the
-     * model, and only a path lets the agent read the file back.
+     * This mirrors the web composer: upload bytes, keep the receipt, and let
+     * the Host resolve it to the stored file and hand the model a readable
+     * path when the turn runs. Clients never derive a path.
      *
      * Files are uploaded one at a time. A batch that failed partway would leave
      * the caller unable to say which entries were stored, and the drafts are
@@ -2906,9 +2902,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     private async uploadPromptFiles(
         sessionId: string,
         drafts: readonly DshFileDraft[],
-    ): Promise<{ text: string }> {
-        if (drafts.length === 0) return { text: "" };
-        const uploaded: DshPromptFile[] = [];
+    ): Promise<readonly DshPromptFilePart[]> {
+        if (drafts.length === 0) return [];
+        const uploaded: DshPromptFilePart[] = [];
         for (const draft of drafts) {
             const bytes = Buffer.from(draft.data, "base64");
             if (bytes.byteLength === 0) {
@@ -2916,24 +2912,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             }
             uploaded.push(await this.fileUploads.upload(sessionId, draft.name, bytes));
         }
-        const lines = uploaded.map((file) => {
-            const attributes = [
-                `name="${escapeContextAttribute(file.name)}"`,
-                ...(file.storedPath === undefined
-                    ? []
-                    : [`path="${escapeContextAttribute(file.storedPath)}"`]),
-                `bytes="${file.bytes}"`,
-            ];
-            return `<uploaded_file ${attributes.join(" ")} />`;
-        });
-        return {
-            text: [
-                "<uploaded_files>",
-                "The user attached the following files to this turn. Read them from the listed paths.",
-                ...lines,
-                "</uploaded_files>",
-            ].join("\n"),
-        };
+        return uploaded;
     }
 
     private insertComposerText(text: string): void {
