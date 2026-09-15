@@ -1,5 +1,6 @@
 import {
     DshApprovalOutcome,
+    DshFileDraft,
     DshImageUpload,
     DshMessageFeedbackRating,
     DshQuestionAnswerItem,
@@ -15,7 +16,7 @@ import { isImageMediaType, isRecord } from "./guards";
 
 export type ChatViewAction =
     | { type: "ready" }
-    | { type: "sendPrompt"; text: string; mode: "queue" | "steer"; images?: DshImageUpload[] }
+    | { type: "sendPrompt"; text: string; mode: "queue" | "steer"; images?: DshImageUpload[]; files?: DshFileDraft[] }
     | { type: "retryPrompt"; id: string }
     | { type: "toggleFocus" }
     | { type: "cancel" }
@@ -124,6 +125,56 @@ function hasOnly(value: Record<string, unknown>, keys: readonly string[]): boole
 
 const MAX_IMAGE_BASE64_CHARACTERS = 16 * 1024 * 1024;
 const MAX_MESSAGE_IMAGE_BASE64_CHARACTERS = 128 * 1024 * 1024;
+
+/**
+ * Ceiling for one general-file draft, in encoded characters.
+ *
+ * The Host re-checks the decoded length against `dsh.maxUploadBytes`; this
+ * bound only keeps an oversized message from being decoded at all.
+ */
+const MAX_FILE_BASE64_CHARACTERS = 96 * 1024 * 1024;
+const MAX_FILE_DRAFTS = 20;
+const MAX_FILE_NAME_CHARACTERS = 512;
+const MAX_FILE_PREVIEW_CHARACTERS = 2 * 1024 * 1024;
+
+/**
+ * Validate the file drafts a webview attached to one prompt.
+ *
+ * Unlike images, an arbitrary file has no media type the Host can trust, so
+ * nothing here is checked against an allowlist: the bytes are uploaded
+ * verbatim and the Runtime decides what they are.
+ *
+ * @returns the accepted drafts, `[]` when none were sent, or `undefined`
+ * when the field is present but malformed.
+ */
+function fileDrafts(value: unknown): DshFileDraft[] | undefined {
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || value.length > MAX_FILE_DRAFTS) return undefined;
+    const files: DshFileDraft[] = [];
+    let totalCharacters = 0;
+    for (const candidate of value) {
+        if (!isRecord(candidate) || !hasOnly(candidate, ["name", "data", "preview"])) return undefined;
+        if (
+            typeof candidate.name !== "string" ||
+            candidate.name.length === 0 ||
+            candidate.name.length > MAX_FILE_NAME_CHARACTERS ||
+            typeof candidate.data !== "string" ||
+            candidate.data.length === 0 ||
+            candidate.data.length > MAX_FILE_BASE64_CHARACTERS ||
+            (candidate.preview !== undefined &&
+                (typeof candidate.preview !== "string" ||
+                    candidate.preview.length > MAX_FILE_PREVIEW_CHARACTERS))
+        ) return undefined;
+        totalCharacters += candidate.data.length;
+        if (totalCharacters > MAX_MESSAGE_IMAGE_BASE64_CHARACTERS) return undefined;
+        files.push({
+            name: candidate.name,
+            data: candidate.data,
+            ...(candidate.preview === undefined ? {} : { preview: candidate.preview }),
+        });
+    }
+    return files;
+}
 
 function imageUploads(value: unknown): DshImageUpload[] | undefined {
     if (value === undefined) return [];
@@ -405,17 +456,20 @@ export function parseChatViewAction(value: unknown): ChatViewAction | undefined 
                   };
         }
         case "sendPrompt":
-            if (!hasOnly(value, ["type", "text", "mode", "images"]) ||
+            if (!hasOnly(value, ["type", "text", "mode", "images", "files"]) ||
                 typeof value.text !== "string" ||
                 (value.mode !== "queue" && value.mode !== "steer")) return undefined;
             {
                 const images = imageUploads(value.images);
-                if (!images || (!value.text.trim() && images.length === 0)) return undefined;
+                const files = fileDrafts(value.files);
+                if (!images || !files) return undefined;
+                if (!value.text.trim() && images.length === 0 && files.length === 0) return undefined;
                 return {
                     type: "sendPrompt",
                     text: value.text,
                     mode: value.mode,
                     ...(images.length === 0 ? {} : { images }),
+                    ...(files.length === 0 ? {} : { files }),
                 };
             }
         case "retryPrompt":

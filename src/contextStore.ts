@@ -97,7 +97,8 @@ function severityLabel(severity: vscode.DiagnosticSeverity): string {
     }
 }
 
-function escapeContextAttribute(value: string): string {
+/** Escapes a value for use inside one attribute of a rendered context block. */
+export function escapeContextAttribute(value: string): string {
     return value
         .replace(/&/g, "&amp;")
         .replace(/"/g, "&quot;")

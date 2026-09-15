@@ -3,8 +3,15 @@ import type { DshReferenceCandidate } from "../../../src/types";
 import { postAction, subscribeAddImageDraft, subscribeInsertText, subscribeSetText } from "../bridge";
 import { t } from "../i18n";
 import { canSwitchPermissions, canTogglePlan, type ComposerState } from "../state";
-import { AppShotIcon, ImageIcon, PlusIcon, SendIcon, StopIcon, TerminalIcon } from "./icons";
+import { AppShotIcon, FileIcon, ImageIcon, PlusIcon, SendIcon, StopIcon, TerminalIcon } from "./icons";
 import { ImageDraftRail, useImageDrafts } from "./ImageDrafts";
+import {
+    FileDraftRail,
+    fileDraftsPayload,
+    offeredFiles,
+    splitImageFiles,
+    useFileDrafts,
+} from "./FileDrafts";
 import { ContextChips } from "./ContextChips";
 import { FILE_REFERENCE_MENU_ID, FileReferenceMenu } from "./FileReferenceMenu";
 import { PermissionModeChip } from "./PermissionModeChip";
@@ -16,6 +23,9 @@ import { SlashCompletionMenu, SkillCompletionMenu } from "./CompletionMenu";
 
 const MIN_HEIGHT = 56;
 const MAX_HEIGHT = 180;
+
+/** Used before the Host has published its own ceilings, or by the dev page. */
+const DEFAULT_FILE_UPLOAD_LIMITS = { maxBytes: 10 * 1024 * 1024, maxFiles: 20 };
 
 interface ComposerProps {
     context: ComposerState["context"];
@@ -29,6 +39,7 @@ interface ComposerProps {
     sessionStats: ComposerState["sessionStats"];
     reasoningEffort: ComposerState["reasoningEffort"];
     imageLimits: ComposerState["imageLimits"];
+    fileUploadLimits: ComposerState["fileUploadLimits"];
     plan: ComposerState["plan"];
     busy: ComposerState["busy"];
     submitting: ComposerState["submitting"];
@@ -48,6 +59,7 @@ export const Composer = React.memo(function Composer({
     sessionStats,
     reasoningEffort,
     imageLimits,
+    fileUploadLimits,
     plan,
     busy,
     submitting,
@@ -63,8 +75,14 @@ export const Composer = React.memo(function Composer({
     const textareaRef = useRef<HTMLTextAreaElement>(null);
     const attachmentMenuRef = useRef<HTMLDivElement>(null);
     const imageInputRef = useRef<HTMLInputElement>(null);
+    const fileInputRef = useRef<HTMLInputElement>(null);
     const planToggleTargetRef = useRef<boolean>();
     const imageDrafts = useImageDrafts(imageLimits);
+    const fileDrafts = useFileDrafts(
+        fileUploadLimits === undefined
+            ? DEFAULT_FILE_UPLOAD_LIMITS
+            : { maxBytes: fileUploadLimits.maxUploadBytes, maxFiles: fileUploadLimits.maxFilesPerMessage },
+    );
     // The projection exposes the requested state while a /plan transition is
     // pending. Fold it the same way as Harness UI: entering plan mode is
     // effective while pending, leaving it is effective immediately.
@@ -178,17 +196,22 @@ export const Composer = React.memo(function Composer({
     const send = useCallback((): void => {
         if (submitting) return;
         const value = textareaRef.current?.value ?? text;
-        if (!value.trim() && imageDrafts.images.length === 0) return;
-        if (imageDrafts.images.length === 0 && completion.executeSlashCommand(value.trim())) return;
+        const attached = imageDrafts.images.length > 0 || fileDrafts.files.length > 0;
+        if (!value.trim() && !attached) return;
+        if (!attached && completion.executeSlashCommand(value.trim())) return;
         postAction({
             type: "sendPrompt",
             text: value,
             mode: busy ? promptMode : "queue",
             images: imageDrafts.images.map((image) => image.upload),
+            ...(fileDrafts.files.length === 0
+                ? {}
+                : { files: fileDraftsPayload(fileDrafts.files) }),
         });
         setText("");
         imageDrafts.clear();
-    }, [completion.executeSlashCommand, imageDrafts, busy, submitting, promptMode, text]);
+        fileDrafts.clear();
+    }, [completion.executeSlashCommand, imageDrafts, fileDrafts, busy, submitting, promptMode, text]);
 
     const sendLabel = t("Send");
     const quotedReferenceMatch = text.match(/(?:^|\s)@"([^"]*)$/u);
@@ -312,6 +335,11 @@ export const Composer = React.memo(function Composer({
                 error={imageDrafts.error}
                 onRemove={imageDrafts.remove}
             />
+            <FileDraftRail
+                files={fileDrafts.files}
+                error={fileDrafts.error}
+                onRemove={fileDrafts.remove}
+            />
             <div
                 className="dsh-composer-row"
                 onDragOver={(event) => {
@@ -321,10 +349,12 @@ export const Composer = React.memo(function Composer({
                     }
                 }}
                 onDrop={(event) => {
-                    const files = Array.from(event.dataTransfer.files).filter((file) => file.type.startsWith("image/"));
+                    const files = offeredFiles(Array.from(event.dataTransfer.items));
                     if (files.length === 0) return;
                     event.preventDefault();
-                    void imageDrafts.addFiles(files);
+                    const { images, others } = splitImageFiles(files);
+                    if (images.length) void imageDrafts.addFiles(images);
+                    if (others.length) void fileDrafts.addFiles(others);
                 }}
             >
                 <div className="dsh-menu-anchor dsh-attachment-anchor" ref={attachmentMenuRef}>
@@ -368,6 +398,17 @@ export const Composer = React.memo(function Composer({
                                 className="dsh-menu-item"
                                 onClick={() => {
                                     setAttachmentMenuVisible(false);
+                                    fileInputRef.current?.click();
+                                }}
+                            >
+                                <FileIcon />
+                                {t("Add files")}
+                            </button>
+                            <button
+                                type="button"
+                                className="dsh-menu-item"
+                                onClick={() => {
+                                    setAttachmentMenuVisible(false);
                                     imageInputRef.current?.click();
                                 }}
                             >
@@ -400,6 +441,18 @@ export const Composer = React.memo(function Composer({
                             void imageDrafts.addFiles(files);
                         }}
                     />
+                    <input
+                        ref={fileInputRef}
+                        className="dsh-image-input"
+                        type="file"
+                        multiple
+                        tabIndex={-1}
+                        onChange={(event) => {
+                            const files = Array.from(event.target.files ?? []);
+                            event.target.value = "";
+                            void fileDrafts.addFiles(files);
+                        }}
+                    />
                 </div>
                 <textarea
                     ref={textareaRef}
@@ -418,10 +471,12 @@ export const Composer = React.memo(function Composer({
                         completion.resetSlashIndex();
                     }}
                     onPaste={(event) => {
-                        const files = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+                        const files = offeredFiles(Array.from(event.clipboardData.items));
                         if (files.length === 0) return;
                         event.preventDefault();
-                        void imageDrafts.addFiles(files);
+                        const { images, others } = splitImageFiles(files);
+                        if (images.length) void imageDrafts.addFiles(images);
+                        if (others.length) void fileDrafts.addFiles(others);
                     }}
                     onKeyDown={(event) => {
                         // Shift+Tab toggles the public plan command when no
@@ -470,7 +525,7 @@ export const Composer = React.memo(function Composer({
                     title={busy ? t("Stop") : sendLabel}
                     disabled={busy
                         ? cancelling
-                        : submitting || (!text.trim() && imageDrafts.images.length === 0)}
+                        : submitting || (!text.trim() && imageDrafts.images.length === 0 && fileDrafts.files.length === 0)}
                     onClick={() => {
                         if (busy) {
                             postAction({ type: "cancel" });

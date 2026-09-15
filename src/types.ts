@@ -64,6 +64,22 @@ export interface DshImageUpload {
     name?: string;
 }
 
+/**
+ * One file the webview read from the clipboard, a drop, or the picker.
+ *
+ * The bytes travel as canonical base64 because the webview and the extension
+ * host share no memory. Images additionally carry a preview data URL, which is
+ * presentation only and never reaches the Runtime.
+ */
+export interface DshFileDraft {
+    /** Display name; the Host reduces it to a leaf before uploading. */
+    name: string;
+    /** Exact file bytes, canonically base64 encoded. */
+    data: string;
+    /** Data URL preview, present only for images small enough to inline. */
+    preview?: string;
+}
+
 export interface ChatImageView {
     attachmentId?: string;
     mediaType: DshImageMediaType;
@@ -1204,6 +1220,8 @@ export interface ChatViewState {
     todos?: DshTodoItemView[];
     schedule?: DshScheduleItem[];
     imageLimits?: DshImageLimitsView;
+    /** Byte and count ceilings the Host enforces on general file attachments. */
+    fileUploadLimits?: DshFileUploadLimitsView;
     plan?: DshPlanProjection;
     messageFeedback?: DshMessageFeedbackStateView;
     interactions: Array<{
@@ -1237,6 +1255,11 @@ export interface ChatViewState {
     subagentPreview?: SubagentHistoryPreview;
     jobs: JobCenterItem[];
     changeReviews: ChangeReviewView[];
+}
+
+export interface DshFileUploadLimitsView {
+    maxUploadBytes: number;
+    maxFilesPerMessage: number;
 }
 
 export interface DshImageLimitsView {

@@ -39,6 +39,8 @@ import {
 } from "./codeBlockActions";
 import { MarkdownRenderCache } from "./markdownRenderCache";
 import { samePath } from "./paths";
+import { DshFileUploads, DshPromptFile } from "./fileUpload";
+import { escapeContextAttribute } from "./contextStore";
 import { presentSessionRows } from "./sessionCatalog";
 import { SessionCatalogCache } from "./sessionCatalogCache";
 import { listPromptTemplates, readPromptTemplate } from "./promptTemplates";
@@ -83,6 +85,8 @@ import {
     DshDynamicPluginPanelView,
     DshImageLimitsView,
     DshImageUpload,
+    DshFileDraft,
+    DshFileUploadLimitsView,
     DshFileReferenceCandidate,
     DshSessionReferenceCandidate,
     DshReferenceCandidate,
@@ -115,6 +119,11 @@ interface PersistedSession {
     sessionId: string;
     cwd: string;
 }
+
+/** Default ceiling for one attached file, matching the runtime image allowance. */
+const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+/** Files one prompt may attach; the Runtime stages each one separately. */
+const MAX_FILES_PER_MESSAGE = 20;
 
 export type QuickTaskKind = "explain" | "fix" | "review" | "docs";
 
@@ -313,6 +322,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     private dynamicPluginsGeneration = 0;
     private readonly changeReviews: ChangeReviewStore;
     private readonly toolDiffs: ToolDiffStore;
+    private readonly fileUploads: DshFileUploads;
     private agentStatusChoice: { sessionId: string; candidateKey: string; label: string } | undefined;
 
     public constructor(
@@ -326,6 +336,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         private readonly agentStatusPresentations?: AgentStatusPresentationRegistry,
     ) {
         this.changeReviews = new ChangeReviewStore(output);
+        this.fileUploads = new DshFileUploads({
+            baseUrl: () => runtime.getUrl(),
+            requestHeaders: () => runtime.requestHeaders(),
+            dshHome: () => runtime.getDshHome(),
+            maxBytes: () => this.fileUploadLimits().maxUploadBytes,
+        });
         this.goalActivation = new GoalActivationController(
             (sessionId) => runtime.getGoalActivation(sessionId),
             () => this.schedulePostState(),
@@ -1125,7 +1141,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
                     if (this.sessionId) void this.subagents.refreshSubagentTree(this.sessionId);
                     break;
                 case "sendPrompt":
-                    await this.sendPrompt(message.text ?? "", message.mode, message.images ?? []);
+                    await this.sendPrompt(
+                        message.text ?? "",
+                        message.mode,
+                        message.images ?? [],
+                        message.files ?? [],
+                    );
                     break;
                 case "retryPrompt":
                     await this.retryPrompt(message.id);
@@ -1546,15 +1567,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         rawText: string,
         requestedMode: "queue" | "steer",
         requestedImages: readonly DshImageUpload[] = [],
+        requestedFiles: readonly DshFileDraft[] = [],
     ): Promise<void> {
         const text = rawText.trim();
-        if ((!text && requestedImages.length === 0) || this.submitting) {
+        const hasAttachments = requestedImages.length > 0 || requestedFiles.length > 0;
+        if ((!text && !hasAttachments) || this.submitting) {
             return;
         }
 
         // Do not let a disabled optional command fall through as ordinary model input.
         if (
-            requestedImages.length === 0 && /^\/compact$/u.test(text) &&
+            !hasAttachments && /^\/compact$/u.test(text) &&
             !vscode.workspace.getConfiguration("dsh").get<boolean>("enableCompaction", true)
         ) {
             this.reportError(new Error(t("The connected dsh server does not expose the /compact command. Update dsh or enable the command-compact package.")));
@@ -1581,7 +1604,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             }
 
             const session = await this.getOrCreateSession(workspaceRoot);
-            if (requestedImages.length === 0 && /^\/ide(?:$|[\t\n\r ])/u.test(text)) {
+            if (!hasAttachments && /^\/ide(?:$|[\t\n\r ])/u.test(text)) {
                 await this.openIdeContextPicker();
                 return;
             }
@@ -1616,7 +1639,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             if (explicitlyReferencesSelection && !capture.items.some((item) => item.kind === "selection")) {
                 throw new Error(t("@selection has no current selection. Select text in the active editor first."));
             }
-            const prompt = capture.text ? `${promptText}\n\n${capture.text}` : promptText;
+            const uploadedFiles = await this.uploadPromptFiles(session, requestedFiles);
+            const withContext = capture.text ? `${promptText}\n\n${capture.text}` : promptText;
+            const prompt = uploadedFiles.text
+                ? `${withContext}\n\n${uploadedFiles.text}`
+                : withContext;
             let limits = imageLimitsProjection(
                 this.runtime.getSessionStore().get(session)?.projections
                     .find((cell) => cell.key === "imageLimits")?.value,
@@ -1642,6 +1669,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
                 wireText: prompt,
                 ...(prepared.views.length === 0 ? {} : { images: prepared.views }),
                 ...(prepared.uploads.length === 0 ? {} : { imageUploads: prepared.uploads }),
+                ...(requestedFiles.length === 0 ? {} : { fileUploads: [...requestedFiles] }),
                 afterSeq: highestKnownSeq(this.runtime.getSessionStore().get(session)),
                 createdAt: Date.now(),
             };
@@ -1691,9 +1719,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         optimistic.createdAt = Date.now();
         this.postState();
         try {
+            // A retry replays the exact earlier request. Uploaded files are
+            // re-sent from the retained drafts, because the stored receipts were
+            // consumed by the failed attempt.
+            const replayed = await this.uploadPromptFiles(
+                this.sessionId,
+                optimistic.fileUploads ?? [],
+            );
             const result = await this.runtime.prompt(
                 this.sessionId,
-                optimistic.wireText,
+                replayed.text
+                    ? `${optimistic.wireText}\n\n${replayed.text}`
+                    : optimistic.wireText,
                 "queue",
                 optimistic.imageUploads ?? [],
                 optimistic.requestId,
@@ -2844,6 +2881,61 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         ).toString();
     }
 
+    /** Ceilings the Host enforces on general file attachments. */
+    private fileUploadLimits(): DshFileUploadLimitsView {
+        const configured = vscode.workspace
+            .getConfiguration("dsh")
+            .get<number>("maxUploadBytes", DEFAULT_MAX_UPLOAD_BYTES);
+        const maxUploadBytes = Number.isFinite(configured) && configured > 0
+            ? Math.floor(configured)
+            : DEFAULT_MAX_UPLOAD_BYTES;
+        return { maxUploadBytes, maxFilesPerMessage: MAX_FILES_PER_MESSAGE };
+    }
+
+    /**
+     * Upload every drafted file and render the block that names them.
+     *
+     * The Runtime stores each file and answers with an opaque receipt, so the
+     * prompt is given the stored path instead: the receipt never reaches the
+     * model, and only a path lets the agent read the file back.
+     *
+     * Files are uploaded one at a time. A batch that failed partway would leave
+     * the caller unable to say which entries were stored, and the drafts are
+     * retained either way so a retry re-uploads rather than pressing on.
+     */
+    private async uploadPromptFiles(
+        sessionId: string,
+        drafts: readonly DshFileDraft[],
+    ): Promise<{ text: string }> {
+        if (drafts.length === 0) return { text: "" };
+        const uploaded: DshPromptFile[] = [];
+        for (const draft of drafts) {
+            const bytes = Buffer.from(draft.data, "base64");
+            if (bytes.byteLength === 0) {
+                throw new Error(t("Attached file {name} is empty.", { name: draft.name }));
+            }
+            uploaded.push(await this.fileUploads.upload(sessionId, draft.name, bytes));
+        }
+        const lines = uploaded.map((file) => {
+            const attributes = [
+                `name="${escapeContextAttribute(file.name)}"`,
+                ...(file.storedPath === undefined
+                    ? []
+                    : [`path="${escapeContextAttribute(file.storedPath)}"`]),
+                `bytes="${file.bytes}"`,
+            ];
+            return `<uploaded_file ${attributes.join(" ")} />`;
+        });
+        return {
+            text: [
+                "<uploaded_files>",
+                "The user attached the following files to this turn. Read them from the listed paths.",
+                ...lines,
+                "</uploaded_files>",
+            ].join("\n"),
+        };
+    }
+
     private insertComposerText(text: string): void {
         this.pendingComposerUpdate = { type: "insertText", text };
         this.reveal();
@@ -3002,6 +3094,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             ...(todos === undefined ? {} : { todos }),
             ...(schedule === undefined ? {} : { schedule }),
             ...(imageLimits === undefined ? {} : { imageLimits }),
+            fileUploadLimits: this.fileUploadLimits(),
             ...(plan === undefined ? {} : { plan }),
             interactions: activeInteractions.map((interaction) =>
                 interaction.kind === "approval"
