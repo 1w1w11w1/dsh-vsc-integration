@@ -1,26 +1,17 @@
-import { createHash } from "node:crypto";
-import { isAbsolute, join, posix } from "node:path";
-import { sha256ScopedFile } from "./paths";
+import { posix } from "node:path";
 
 /**
  * Client for the Harness raw-byte upload route.
  *
- * DSH stores an uploaded file verbatim under its attachment root and answers
- * with an opaque receipt. That receipt is what a prompt cites; the stored path
- * is deliberately never on the wire. This module owns both halves of that
- * contract for the extension: the upload call, and the local derivation of the
- * stored path a prompt has to name instead.
+ * The web surface uploads a file and sends the returned opaque receipt as a
+ * `{ type: "file", receiptId }` content part; the Host resolves that receipt
+ * to the stored file and hands the model a readable path when the turn runs.
+ * Paths are never derived by a client — the Host owns its own home and layout,
+ * so this module stops at the receipt, exactly like the web composer.
  */
 
 /** Raw-byte route owned by the Harness file-upload plugin. */
 const UPLOAD_PATH = "/api/session/uploadFileBinary";
-
-/**
- * Attachment root the Harness stores verbatim files under, relative to its
- * home. Mirrors the DSH attachment provider's layout:
- * `<root>/files/<digest prefix>/<digest>/<name>`.
- */
-const ATTACHMENT_FILES_SEGMENTS = ["attachments", "v1", "files"] as const;
 
 /** Durable reference to one verbatim stored file, as the upload route reports it. */
 export interface DshUploadedFileRef {
@@ -44,8 +35,6 @@ export interface DshFileUploadOptions {
     baseUrl: string | (() => string | undefined);
     /** Authenticated request headers, evaluated per call. */
     requestHeaders: () => Record<string, string>;
-    /** Harness home the attachment root hangs off, or `undefined` when unknown. */
-    dshHome: () => string | undefined;
     /** Byte ceiling enforced before a request is attempted. */
     maxBytes: () => number;
     /** Injected for tests; defaults to the global fetch. */
@@ -61,7 +50,7 @@ export class DshFileUploadError extends Error {
 
 /**
  * Reject a value that is not a well-formed upload result before it reaches the
- * prompt layer, so a malformed response cannot become an empty path.
+ * prompt layer, so a malformed response cannot become an empty receipt.
  */
 function parseUploadResult(value: unknown): DshUploadedFile | undefined {
     if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
@@ -80,62 +69,27 @@ function parseUploadResult(value: unknown): DshUploadedFile | undefined {
     };
 }
 
-/**
- * Digest carried by an attachment id of the form `sha256:<hex>`.
- * @returns the lowercase hex digest, or `undefined` for any other shape.
- */
-export function attachmentDigest(attachmentId: string): string | undefined {
-    const match = /^sha256:([0-9a-f]{64})$/u.exec(attachmentId);
-    return match?.[1];
-}
-
-/**
- * Absolute path the Harness stores one uploaded file at.
- *
- * The stored path is content-addressed, so uploading identical bytes twice
- * resolves to the same file. Names that differ only by directory resolve to the
- * same object too, because the upload route reduces a supplied name to its leaf.
- *
- * @param home - Harness home directory. Callers that cannot prove it belongs to
- * the connected Runtime must not treat the result as authoritative.
- * @param file - Durable reference reported by the upload route.
- * @returns the absolute stored path, or `undefined` when the reference is not
- * one this layout can describe.
- */
-export function attachmentStoredPath(
-    home: string,
-    file: DshUploadedFileRef,
-): string | undefined {
-    const digest = attachmentDigest(file.attachmentId);
-    if (digest === undefined || !isAbsolute(home)) return undefined;
-    // The depth varies by platform, so the root is joined natively and only the
-    // fixed attachment segments are appended lexically.
-    return join(
-        sha256ScopedFile(join(home, ...ATTACHMENT_FILES_SEGMENTS), digest),
-        file.name,
-    );
-}
-
 /** Basename of a prompt-supplied display name, in the form the route sanitizes to. */
 function uploadLeafName(name: string): string {
     const leaf = posix.basename(name.replaceAll("\\", "/"));
     return leaf.slice(0, 255);
 }
 
-/** One uploaded file the prompt layer can both cite and describe. */
+/** One uploaded file a prompt can cite by its receipt. */
 export interface DshPromptFile {
     receiptId: string;
-    name: string;
-    bytes: number;
-    /** Stored path, present only when it could be derived with certainty. */
-    storedPath?: string;
+}
+
+/** Content part a prompt carries for one uploaded file. */
+export interface DshPromptFilePart {
+    receiptId: string;
 }
 
 export class DshFileUploads {
     public constructor(private readonly options: DshFileUploadOptions) {}
 
     /**
-     * Upload one file for a Session and report where the Harness stored it.
+     * Upload one file for a Session and report its receipt.
      *
      * @param sessionId - Session that owns the staged receipt.
      * @param name - Display name, reduced to its leaf before it is sent.
@@ -223,20 +177,6 @@ export class DshFileUploads {
             );
         }
 
-        const home = this.options.dshHome();
-        const storedPath = home === undefined
-            ? undefined
-            : attachmentStoredPath(home, parsed.file);
-        return {
-            receiptId: parsed.receiptId,
-            name: parsed.file.name,
-            bytes: parsed.file.bytes,
-            ...(storedPath === undefined ? {} : { storedPath }),
-        };
+        return { receiptId: parsed.receiptId };
     }
-}
-
-/** Digest of one file, as the DSH attachment id spells it. */
-export function fileContentId(data: Uint8Array): string {
-    return `sha256:${createHash("sha256").update(data).digest("hex")}`;
 }

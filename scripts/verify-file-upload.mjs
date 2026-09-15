@@ -6,11 +6,18 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
-import { join } from "node:path";
 
 const require = createRequire(import.meta.url);
-const { DshFileUploads, attachmentStoredPath, fileContentId } =
-    require("../dist/fileUpload");
+const Module = require("node:module");
+const originalLoad = Module._load;
+let DshRuntime;
+try {
+    Module._load = function (id, ...args) {
+        return id === "vscode" ? {} : originalLoad.call(this, id, ...args);
+    };
+    ({ DshRuntime } = require("../dist/dshRuntime"));
+} finally { Module._load = originalLoad; }
+const { DshFileUploads } = require("../dist/fileUpload");
 
 const failures = [];
 async function scenario(label, run) {
@@ -44,7 +51,6 @@ async function harness(reply) {
     };
 }
 
-const HOME = process.platform === "win32" ? "C:\\dsh-home" : "/dsh-home";
 const SESSION = "session-1";
 
 /** Upload one payload against a stub that echoes a well-formed receipt. */
@@ -66,7 +72,6 @@ async function uploadWith(data, options = {}) {
     const uploads = new DshFileUploads({
         baseUrl: stub.baseUrl,
         requestHeaders: () => ({ cookie: "dsh_session=abc" }),
-        dshHome: () => HOME,
         maxBytes: () => options.maxBytes ?? 10 * 1024 * 1024,
     });
     try {
@@ -93,7 +98,7 @@ await scenario("the route receives the exact bytes under the documented header",
         // Authentication rides the same cookie the RC client uses.
         assert.equal(request.cookie, "dsh_session=abc");
         assert.deepEqual(request.body, data);
-        assert.equal(file.bytes, data.byteLength);
+        assert.equal(file.receiptId, "receipt-1");
     } finally { await stub.close(); }
 });
 
@@ -105,27 +110,13 @@ await scenario("a directory-bearing name is reduced to its leaf before upload", 
     } finally { await stub.close(); }
 });
 
-await scenario("the stored path follows the content-addressed attachment layout", async () => {
-    const data = Buffer.from("stored", "utf8");
-    const digest = createHash("sha256").update(data).digest("hex");
-    const { file, stub } = await uploadWith(data);
+await scenario("the upload reports the receipt the prompt will cite", async () => {
+    const { file, stub } = await uploadWith(Buffer.from("cited", "utf8"));
     try {
-        assert.equal(file.storedPath, join(HOME, "attachments", "v1", "files",
-            digest.slice(0, 2), digest, "notes.pdf"));
+        // The client stops at the receipt, exactly like the web composer: the
+        // Host resolves it to a readable path when the turn runs.
+        assert.equal(file.receiptId, "receipt-1");
     } finally { await stub.close(); }
-});
-
-await scenario("identical bytes resolve to one stored object", async () => {
-    const data = Buffer.from("same", "utf8");
-    const first = await uploadWith(data, { name: "a.txt", storedName: "a.txt" });
-    const second = await uploadWith(data, { name: "b.txt", storedName: "b.txt" });
-    try {
-        // Only the leaf name differs, so the directory digest is shared.
-        assert.equal(
-            join(first.file.storedPath, ".."),
-            join(second.file.storedPath, ".."),
-        );
-    } finally { await first.stub.close(); await second.stub.close(); }
 });
 
 await scenario("a file over the ceiling is refused without a request", async () => {
@@ -143,7 +134,6 @@ await scenario("a business failure in a 200 envelope is not treated as success",
     const uploads = new DshFileUploads({
         baseUrl: stub.baseUrl,
         requestHeaders: () => ({}),
-        dshHome: () => HOME,
         maxBytes: () => 1024,
     });
     try {
@@ -161,22 +151,32 @@ await scenario("a byte-count mismatch is refused rather than reported as stored"
     } finally { await stub.close(); }
 });
 
+await scenario("the prompt content carries one file part per uploaded receipt", async () => {
+    const runtime = Object.create(DshRuntime.prototype);
+    let seen;
+    runtime.apiClient = {
+        call: async (_method, args) => { seen = args; return { accepted: true }; },
+    };
+    await runtime.prompt("session-1", "read these", "queue", [], "request-1", [
+        { receiptId: "receipt-1" },
+    ]);
+    assert.ok(seen, "prompt must reach the client");
+    const files = seen.request.content.filter((part) => part.type === "file");
+    assert.deepEqual(files, [{ type: "file", receiptId: "receipt-1" }]);
+    // The text part stays intact; the file part rides alongside it.
+    assert.ok(seen.request.content.some((part) => part.type === "text" && part.text === "read these"));
+});
+
 await scenario("an upload with no reachable Runtime reports its own failure", async () => {
     const uploads = new DshFileUploads({
         baseUrl: () => undefined,
         requestHeaders: () => ({}),
-        dshHome: () => HOME,
         maxBytes: () => 1024,
     });
     await assert.rejects(
         () => uploads.upload(SESSION, "a.txt", Buffer.from("x")),
         /not running/u,
     );
-});
-
-await scenario("a reference this layout cannot describe yields no path", async () => {
-    assert.equal(attachmentStoredPath(HOME, { attachmentId: "opaque", name: "a.txt", bytes: 1 }), undefined);
-    assert.equal(attachmentStoredPath("relative", { attachmentId: fileContentId(Buffer.from("x")), name: "a.txt", bytes: 1 }), undefined);
 });
 
 if (failures.length > 0) {
