@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Loopback Harness upload route -> DSH file-upload client contract smoke.
+// Loopback Harness upload route -> Runtime prompt contract smoke.
 // Usage: npx tsc -p tsconfig.json && node scripts/verify-file-upload.mjs
 // No network, model calls, or real Runtime are needed.
 import assert from "node:assert/strict";
@@ -17,7 +17,14 @@ try {
     };
     ({ DshRuntime } = require("../dist/dshRuntime"));
 } finally { Module._load = originalLoad; }
-const { DshFileUploads } = require("../dist/fileUpload");
+
+function runtimeFor(baseUrl, cookie) {
+    return Object.assign(Object.create(DshRuntime.prototype), {
+        baseUrl,
+        authCookie: cookie,
+        configuration: () => ({ get: (_key, fallback) => fallback }),
+    });
+}
 
 const failures = [];
 async function scenario(label, run) {
@@ -69,14 +76,16 @@ async function uploadWith(data, options = {}) {
             },
         },
     }));
-    const uploads = new DshFileUploads({
-        baseUrl: stub.baseUrl,
-        requestHeaders: () => ({ cookie: "dsh_session=abc" }),
-        maxBytes: () => options.maxBytes ?? 10 * 1024 * 1024,
-    });
+    const runtime = runtimeFor(stub.baseUrl, "dsh_session=abc");
+    let content;
+    runtime.apiClient = {
+        call: async (_method, args) => { content = args.request.content; return { accepted: true }; },
+    };
     try {
-        const file = await uploads.upload(SESSION, options.name ?? "notes.pdf", data);
-        return { file, stub };
+        await runtime.prompt(SESSION, options.text ?? "", "queue", [], "request-1", [
+            { name: options.name ?? "notes.pdf", data: data.toString("base64") },
+        ]);
+        return { content, stub };
     } catch (error) {
         return { error, stub };
     }
@@ -84,7 +93,7 @@ async function uploadWith(data, options = {}) {
 
 await scenario("the route receives the exact bytes under the documented header", async () => {
     const data = Buffer.from("hello dsh", "utf8");
-    const { file, stub } = await uploadWith(data);
+    const { content, stub } = await uploadWith(data);
     try {
         assert.equal(stub.seen.length, 1);
         const request = stub.seen[0];
@@ -98,7 +107,7 @@ await scenario("the route receives the exact bytes under the documented header",
         // Authentication rides the same cookie the RC client uses.
         assert.equal(request.cookie, "dsh_session=abc");
         assert.deepEqual(request.body, data);
-        assert.equal(file.receiptId, "receipt-1");
+        assert.deepEqual(content, [{ type: "file", receiptId: "receipt-1" }]);
     } finally { await stub.close(); }
 });
 
@@ -110,35 +119,14 @@ await scenario("a directory-bearing name is reduced to its leaf before upload", 
     } finally { await stub.close(); }
 });
 
-await scenario("the upload reports the receipt the prompt will cite", async () => {
-    const { file, stub } = await uploadWith(Buffer.from("cited", "utf8"));
-    try {
-        // The client stops at the receipt, exactly like the web composer: the
-        // Host resolves it to a readable path when the turn runs.
-        assert.equal(file.receiptId, "receipt-1");
-    } finally { await stub.close(); }
-});
-
-await scenario("a file over the ceiling is refused without a request", async () => {
-    const { error, stub } = await uploadWith(Buffer.alloc(2048), { maxBytes: 1024 });
-    try {
-        assert.ok(error, "an oversized file must be refused");
-        assert.equal(stub.seen.length, 0, "the ceiling must be enforced before the request");
-    } finally { await stub.close(); }
-});
-
 await scenario("a business failure in a 200 envelope is not treated as success", async () => {
     const stub = await harness(async () => ({
         body: { ok: false, error: { code: "session/attachment-invalid", message: "File was not uploaded for this session." } },
     }));
-    const uploads = new DshFileUploads({
-        baseUrl: stub.baseUrl,
-        requestHeaders: () => ({}),
-        maxBytes: () => 1024,
-    });
+    const runtime = runtimeFor(stub.baseUrl);
     try {
         await assert.rejects(
-            () => uploads.upload(SESSION, "a.txt", Buffer.from("x")),
+            () => runtime.prompt(SESSION, "", "queue", [], "request-1", [{ name: "a.txt", data: "eA==" }]),
             /File was not uploaded for this session/u,
         );
     } finally { await stub.close(); }
@@ -152,29 +140,19 @@ await scenario("a byte-count mismatch is refused rather than reported as stored"
 });
 
 await scenario("the prompt content carries one file part per uploaded receipt", async () => {
-    const runtime = Object.create(DshRuntime.prototype);
-    let seen;
-    runtime.apiClient = {
-        call: async (_method, args) => { seen = args; return { accepted: true }; },
-    };
-    await runtime.prompt("session-1", "read these", "queue", [], "request-1", [
-        { receiptId: "receipt-1" },
-    ]);
-    assert.ok(seen, "prompt must reach the client");
-    const files = seen.request.content.filter((part) => part.type === "file");
-    assert.deepEqual(files, [{ type: "file", receiptId: "receipt-1" }]);
-    // The text part stays intact; the file part rides alongside it.
-    assert.ok(seen.request.content.some((part) => part.type === "text" && part.text === "read these"));
+    const { content, stub } = await uploadWith(Buffer.from("cited"), { text: "read these" });
+    try {
+        assert.deepEqual(content, [
+            { type: "text", text: "read these" },
+            { type: "file", receiptId: "receipt-1" },
+        ]);
+    } finally { await stub.close(); }
 });
 
 await scenario("an upload with no reachable Runtime reports its own failure", async () => {
-    const uploads = new DshFileUploads({
-        baseUrl: () => undefined,
-        requestHeaders: () => ({}),
-        maxBytes: () => 1024,
-    });
+    const runtime = runtimeFor(undefined);
     await assert.rejects(
-        () => uploads.upload(SESSION, "a.txt", Buffer.from("x")),
+        () => runtime.prompt(SESSION, "", "queue", [], "request-1", [{ name: "a.txt", data: "eA==" }]),
         /not running/u,
     );
 });

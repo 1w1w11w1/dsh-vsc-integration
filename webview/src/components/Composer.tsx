@@ -5,13 +5,7 @@ import { t } from "../i18n";
 import { canSwitchPermissions, canTogglePlan, type ComposerState } from "../state";
 import { AppShotIcon, FileIcon, ImageIcon, PlusIcon, SendIcon, StopIcon, TerminalIcon } from "./icons";
 import { ImageDraftRail, useImageDrafts } from "./ImageDrafts";
-import {
-    FileDraftRail,
-    fileDraftsPayload,
-    offeredFiles,
-    splitImageFiles,
-    useFileDrafts,
-} from "./FileDrafts";
+import { FileDraftRail, splitImageFiles, useFileDrafts } from "./FileDrafts";
 import { ContextChips } from "./ContextChips";
 import { FILE_REFERENCE_MENU_ID, FileReferenceMenu } from "./FileReferenceMenu";
 import { PermissionModeChip } from "./PermissionModeChip";
@@ -23,9 +17,6 @@ import { SlashCompletionMenu, SkillCompletionMenu } from "./CompletionMenu";
 
 const MIN_HEIGHT = 56;
 const MAX_HEIGHT = 180;
-
-/** Used before the Host has published its own ceilings, or by the dev page. */
-const DEFAULT_FILE_UPLOAD_LIMITS = { maxBytes: 1024 * 1024 * 1024, maxFiles: 20 };
 
 interface ComposerProps {
     context: ComposerState["context"];
@@ -40,7 +31,6 @@ interface ComposerProps {
     sessionStats: ComposerState["sessionStats"];
     reasoningEffort: ComposerState["reasoningEffort"];
     imageLimits: ComposerState["imageLimits"];
-    fileUploadLimits: ComposerState["fileUploadLimits"];
     plan: ComposerState["plan"];
     busy: ComposerState["busy"];
     submitting: ComposerState["submitting"];
@@ -61,7 +51,6 @@ export const Composer = React.memo(function Composer({
     sessionStats,
     reasoningEffort,
     imageLimits,
-    fileUploadLimits,
     plan,
     busy,
     submitting,
@@ -80,11 +69,7 @@ export const Composer = React.memo(function Composer({
     const fileInputRef = useRef<HTMLInputElement>(null);
     const planToggleTargetRef = useRef<boolean>();
     const imageDrafts = useImageDrafts(imageLimits);
-    const fileDrafts = useFileDrafts(
-        fileUploadLimits === undefined
-            ? DEFAULT_FILE_UPLOAD_LIMITS
-            : { maxBytes: fileUploadLimits.maxUploadBytes, maxFiles: fileUploadLimits.maxFilesPerMessage },
-    );
+    const fileDrafts = useFileDrafts();
     // The projection exposes the requested state while a /plan transition is
     // pending. Fold it the same way as Harness UI: entering plan mode is
     // effective while pending, leaving it is effective immediately.
@@ -207,9 +192,7 @@ export const Composer = React.memo(function Composer({
             text: value,
             mode: busy ? promptMode : "queue",
             images: imageDrafts.images.map((image) => image.upload),
-            ...(fileDrafts.files.length === 0
-                ? {}
-                : { files: fileDraftsPayload(fileDrafts.files) }),
+            files: fileDrafts.files.map(({ name, data }) => ({ name, data })),
         });
         setText("");
         imageDrafts.clear();
@@ -352,7 +335,7 @@ export const Composer = React.memo(function Composer({
                     }
                 }}
                 onDrop={(event) => {
-                    const files = offeredFiles(Array.from(event.dataTransfer.items));
+                    const files = Array.from(event.dataTransfer.files);
                     if (files.length === 0) return;
                     event.preventDefault();
                     const { images, others } = splitImageFiles(files);
@@ -474,7 +457,7 @@ export const Composer = React.memo(function Composer({
                         completion.resetSlashIndex();
                     }}
                     onPaste={(event) => {
-                        const files = offeredFiles(Array.from(event.clipboardData.items));
+                        const files = Array.from(event.clipboardData.files);
                         if (files.length === 0) return;
                         event.preventDefault();
                         const { images, others } = splitImageFiles(files);

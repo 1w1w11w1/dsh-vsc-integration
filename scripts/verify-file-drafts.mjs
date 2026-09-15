@@ -80,15 +80,6 @@ try {
         // A browser reports an empty type for .zip, which the old filter dropped.
         assert.deepEqual(others.map((file) => file.name), ["b.zip", "c.pdf"]);
     });
-
-    await scenario("offered files come from file items only", () => {
-        const zip = { type: "", name: "b.zip" };
-        const files = drafts.offeredFiles([
-            { kind: "file", getAsFile: () => zip },
-            { kind: "string", getAsFile: () => null },
-        ]);
-        assert.deepEqual(files.map((file) => file.name), ["b.zip"]);
-    });
 } finally {
     rmSync(out, { recursive: true, force: true });
 }

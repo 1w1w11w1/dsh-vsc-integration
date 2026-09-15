@@ -27,9 +27,8 @@ scenario("an empty text with no attachment is still rejected", () => {
     assert.equal(send({}), undefined);
 });
 
-scenario("a file draft keeps its optional preview and drops unknown keys", () => {
-    assert.equal(send({ files: [{ ...draft, preview: "data:image/png;base64,AA" }] }).files[0].preview,
-        "data:image/png;base64,AA");
+scenario("a file draft rejects fields outside the upload contract", () => {
+    assert.equal(send({ files: [{ ...draft, preview: "data:image/png;base64,AA" }] }), undefined);
     assert.equal(send({ files: [{ ...draft, extra: 1 }] }), undefined);
 });
 

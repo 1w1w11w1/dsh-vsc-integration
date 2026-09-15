@@ -27,4 +27,3 @@ export function containsPath(root: string, candidate: string): boolean {
 export function samePath(left: string, right: string): boolean {
     return containsPath(left, right) && containsPath(right, left);
 }
-

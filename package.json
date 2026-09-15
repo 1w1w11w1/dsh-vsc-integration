@@ -595,13 +595,6 @@
                     "maximum": 1000000,
                     "description": "%config.maxContextBytes.description%"
                 },
-                "dsh.maxUploadBytes": {
-                    "type": "number",
-                    "default": 1073741824,
-                    "minimum": 1024,
-                    "maximum": 1073741824,
-                    "description": "%config.maxUploadBytes.description%"
-                },
                 "dsh.terminalHistorySize": {
                     "type": "number",
                     "default": 20,

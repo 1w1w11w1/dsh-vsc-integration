@@ -126,55 +126,30 @@ function hasOnly(value: Record<string, unknown>, keys: readonly string[]): boole
 const MAX_IMAGE_BASE64_CHARACTERS = 16 * 1024 * 1024;
 const MAX_MESSAGE_IMAGE_BASE64_CHARACTERS = 128 * 1024 * 1024;
 
-/**
- * Ceiling for one general-file draft, in encoded characters.
- *
- * The Host re-checks the decoded length against `dsh.maxUploadBytes`; this
- * bound only keeps an oversized message from being decoded at all.
- */
-// 1 GiB of file bytes encodes to about 1.43e9 base64 characters; the Host
-// re-checks the decoded length against `dsh.maxUploadBytes`.
+// Bound webview messages before decoding; this is not a configurable upload policy.
 const MAX_FILE_BASE64_CHARACTERS = 2 * 1024 * 1024 * 1024;
 const MAX_FILE_DRAFTS = 20;
 const MAX_MESSAGE_FILE_BASE64_CHARACTERS = 8 * 1024 * 1024 * 1024;
 const MAX_FILE_NAME_CHARACTERS = 512;
-const MAX_FILE_PREVIEW_CHARACTERS = 2 * 1024 * 1024;
 
-/**
- * Validate the file drafts a webview attached to one prompt.
- *
- * Unlike images, an arbitrary file has no media type the Host can trust, so
- * nothing here is checked against an allowlist: the bytes are uploaded
- * verbatim and the Runtime decides what they are.
- *
- * @returns the accepted drafts, `[]` when none were sent, or `undefined`
- * when the field is present but malformed.
- */
 function fileDrafts(value: unknown): DshFileDraft[] | undefined {
     if (value === undefined) return [];
     if (!Array.isArray(value) || value.length > MAX_FILE_DRAFTS) return undefined;
     const files: DshFileDraft[] = [];
     let totalCharacters = 0;
     for (const candidate of value) {
-        if (!isRecord(candidate) || !hasOnly(candidate, ["name", "data", "preview"])) return undefined;
+        if (!isRecord(candidate) || !hasOnly(candidate, ["name", "data"])) return undefined;
         if (
             typeof candidate.name !== "string" ||
             candidate.name.length === 0 ||
             candidate.name.length > MAX_FILE_NAME_CHARACTERS ||
             typeof candidate.data !== "string" ||
             candidate.data.length === 0 ||
-            candidate.data.length > MAX_FILE_BASE64_CHARACTERS ||
-            (candidate.preview !== undefined &&
-                (typeof candidate.preview !== "string" ||
-                    candidate.preview.length > MAX_FILE_PREVIEW_CHARACTERS))
+            candidate.data.length > MAX_FILE_BASE64_CHARACTERS
         ) return undefined;
         totalCharacters += candidate.data.length;
         if (totalCharacters > MAX_MESSAGE_FILE_BASE64_CHARACTERS) return undefined;
-        files.push({
-            name: candidate.name,
-            data: candidate.data,
-            ...(candidate.preview === undefined ? {} : { preview: candidate.preview }),
-        });
+        files.push({ name: candidate.name, data: candidate.data });
     }
     return files;
 }

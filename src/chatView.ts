@@ -39,7 +39,6 @@ import {
 } from "./codeBlockActions";
 import { MarkdownRenderCache } from "./markdownRenderCache";
 import { samePath } from "./paths";
-import { DshFileUploads, DshPromptFilePart } from "./fileUpload";
 import { presentSessionRows } from "./sessionCatalog";
 import { SessionCatalogCache } from "./sessionCatalogCache";
 import { listPromptTemplates, readPromptTemplate } from "./promptTemplates";
@@ -85,7 +84,6 @@ import {
     DshImageLimitsView,
     DshImageUpload,
     DshFileDraft,
-    DshFileUploadLimitsView,
     DshFileReferenceCandidate,
     DshSessionReferenceCandidate,
     DshReferenceCandidate,
@@ -118,11 +116,6 @@ interface PersistedSession {
     sessionId: string;
     cwd: string;
 }
-
-/** Default ceiling for one attached file, matching the runtime image allowance. */
-const DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024;
-/** Files one prompt may attach; the Runtime stages each one separately. */
-const MAX_FILES_PER_MESSAGE = 20;
 
 export type QuickTaskKind = "explain" | "fix" | "review" | "docs";
 
@@ -322,7 +315,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     private dynamicPluginsGeneration = 0;
     private readonly changeReviews: ChangeReviewStore;
     private readonly toolDiffs: ToolDiffStore;
-    private readonly fileUploads: DshFileUploads;
     private agentStatusChoice: { sessionId: string; candidateKey: string; label: string } | undefined;
 
     public constructor(
@@ -336,11 +328,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         private readonly agentStatusPresentations?: AgentStatusPresentationRegistry,
     ) {
         this.changeReviews = new ChangeReviewStore(output);
-        this.fileUploads = new DshFileUploads({
-            baseUrl: () => runtime.getUrl(),
-            requestHeaders: () => runtime.requestHeaders(),
-            maxBytes: () => this.fileUploadLimits().maxUploadBytes,
-        });
         this.goalActivation = new GoalActivationController(
             (sessionId) => runtime.getGoalActivation(sessionId),
             () => this.schedulePostState(),
@@ -1644,7 +1631,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             if (explicitlyReferencesSelection && !capture.items.some((item) => item.kind === "selection")) {
                 throw new Error(t("@selection has no current selection. Select text in the active editor first."));
             }
-            const uploadedFiles = await this.uploadPromptFiles(session, requestedFiles);
             const prompt = capture.text ? `${promptText}\n\n${capture.text}` : promptText;
             let limits = imageLimitsProjection(
                 this.runtime.getSessionStore().get(session)?.projections
@@ -1684,7 +1670,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
                 mode,
                 prepared.uploads,
                 optimistic.requestId,
-                uploadedFiles,
+                requestedFiles,
             );
             if (promptResult.accepted === false) {
                 throw new Error(t("The dsh runtime rejected this prompt. Check the current model and API Key configuration."));
@@ -1722,20 +1708,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         optimistic.createdAt = Date.now();
         this.postState();
         try {
-            // A retry replays the exact earlier request. Uploaded files are
-            // re-sent from the retained drafts, because the stored receipts were
-            // consumed by the failed attempt.
-            const replayed = await this.uploadPromptFiles(
-                this.sessionId,
-                optimistic.fileUploads ?? [],
-            );
             const result = await this.runtime.prompt(
                 this.sessionId,
                 optimistic.wireText,
                 "queue",
                 optimistic.imageUploads ?? [],
                 optimistic.requestId,
-                replayed,
+                optimistic.fileUploads ?? [],
             );
             if (result.accepted === false) throw new Error(t("The dsh runtime rejected this retry."));
         } catch (error) {
@@ -2925,45 +2904,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         ).toString();
     }
 
-    /** Ceilings the Host enforces on general file attachments. */
-    private fileUploadLimits(): DshFileUploadLimitsView {
-        const configured = vscode.workspace
-            .getConfiguration("dsh")
-            .get<number>("maxUploadBytes", DEFAULT_MAX_UPLOAD_BYTES);
-        const maxUploadBytes = Number.isFinite(configured) && configured > 0
-            ? Math.floor(configured)
-            : DEFAULT_MAX_UPLOAD_BYTES;
-        return { maxUploadBytes, maxFilesPerMessage: MAX_FILES_PER_MESSAGE };
-    }
-
-    /**
-     * Upload every drafted file for one send and return the receipts a prompt
-     * cites.
-     *
-     * This mirrors the web composer: upload bytes, keep the receipt, and let
-     * the Host resolve it to the stored file and hand the model a readable
-     * path when the turn runs. Clients never derive a path.
-     *
-     * Files are uploaded one at a time. A batch that failed partway would leave
-     * the caller unable to say which entries were stored, and the drafts are
-     * retained either way so a retry re-uploads rather than pressing on.
-     */
-    private async uploadPromptFiles(
-        sessionId: string,
-        drafts: readonly DshFileDraft[],
-    ): Promise<readonly DshPromptFilePart[]> {
-        if (drafts.length === 0) return [];
-        const uploaded: DshPromptFilePart[] = [];
-        for (const draft of drafts) {
-            const bytes = Buffer.from(draft.data, "base64");
-            if (bytes.byteLength === 0) {
-                throw new Error(t("Attached file {name} is empty.", { name: draft.name }));
-            }
-            uploaded.push(await this.fileUploads.upload(sessionId, draft.name, bytes));
-        }
-        return uploaded;
-    }
-
     private insertComposerText(text: string): void {
         this.pendingComposerUpdate = { type: "insertText", text };
         this.reveal();
@@ -3123,7 +3063,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             ...(todos === undefined ? {} : { todos }),
             ...(schedule === undefined ? {} : { schedule }),
             ...(imageLimits === undefined ? {} : { imageLimits }),
-            fileUploadLimits: this.fileUploadLimits(),
             ...(plan === undefined ? {} : { plan }),
             interactions: activeInteractions.map((interaction) =>
                 interaction.kind === "approval"
