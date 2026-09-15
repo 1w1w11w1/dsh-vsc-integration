@@ -1,4 +1,4 @@
-import { isAbsolute, relative, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 
 /**
  * Whether `candidate` is `root` itself or lies beneath it.
@@ -26,4 +26,20 @@ export function containsPath(root: string, candidate: string): boolean {
  */
 export function samePath(left: string, right: string): boolean {
     return containsPath(left, right) && containsPath(right, left);
+}
+
+/**
+ * Place a sha256-named object file under its two-character fan-out directory.
+ *
+ * Content-addressed stores scatter objects by digest prefix so one directory
+ * never accumulates every entry. The DSH attachment store and this extension's
+ * own caches share that layout, so the fan-out is derived here once rather than
+ * restated per store.
+ *
+ * @param root - Absolute directory holding the object subtrees.
+ * @param sha256 - Lowercase hex digest of the stored bytes.
+ * @returns the absolute object path, without reading or creating anything.
+ */
+export function sha256ScopedFile(root: string, sha256: string): string {
+    return join(root, sha256.slice(0, 2), sha256);
 }

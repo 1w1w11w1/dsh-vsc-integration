@@ -3016,8 +3016,21 @@ export class DshRuntime implements vscode.Disposable {
         }
     }
 
-    private requestHeaders(): Record<string, string> {
+    /** Authenticated request headers for any Runtime HTTP route. */
+    public requestHeaders(): Record<string, string> {
         return this.authCookie === undefined ? {} : { cookie: this.authCookie };
+    }
+
+    /**
+     * Harness home of the Runtime this extension talks to.
+     *
+     * Only trustworthy for a Runtime this extension launched, so callers that
+     * derive paths from it must treat an unknown value as "cannot say" rather
+     * than falling back to a path that may belong to someone else's instance.
+     */
+    public getDshHome(): string | undefined {
+        if (!this.startedByExtension) return undefined;
+        return process.env.DSH_HOME || join(homedir(), ".dsh");
     }
 
     private clearRuntimeAuthentication(): void {
