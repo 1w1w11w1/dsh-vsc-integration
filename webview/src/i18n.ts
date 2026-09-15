@@ -225,6 +225,8 @@ const ZH_CN: Readonly<Record<string, string>> = {
     "Add files": "添加文件",
     "Pending files": "待发送文件",
     "Remove file": "移除文件",
+    "Uploading...": "上传中…",
+    "Upload failed": "上传失败",
     "file": "文件",
     "{size} B": "{size} B",
     "A message can contain at most {count} files.": "每条消息最多可附加 {count} 个文件。",

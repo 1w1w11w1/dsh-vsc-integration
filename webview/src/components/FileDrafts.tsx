@@ -1,7 +1,8 @@
 import React, { useCallback, useRef, useState } from "react";
 import type { DshFileDraft } from "../../../src/types";
 import { t } from "../i18n";
-import { CloseIcon, FileIcon } from "./icons";
+import { CloseIcon } from "./icons";
+import { FileTypeIcon } from "./FileTypeIcon";
 
 /** One attached file, as the composer holds it before sending. */
 export interface DraftFile {
@@ -59,6 +60,39 @@ export function splitImageFiles(files: readonly File[]): { images: File[]; other
         else others.push(file);
     }
     return { images, others };
+}
+
+/** Extension of a display name, without the dot; empty when there is none. */
+export function fileExtension(name: string): string {
+    const leaf = name.slice(Math.max(name.lastIndexOf("/"), name.lastIndexOf("\\")) + 1);
+    const dot = leaf.lastIndexOf(".");
+    return dot <= 0 ? "" : leaf.slice(dot + 1);
+}
+
+/**
+ * Human byte size, in the same units and precision the Harness UI uses.
+ *
+ * The steps are decimal-reading but binary-based, which is what the rest of the
+ * product shows; matching it keeps one file from reading differently in the
+ * composer and in the transcript.
+ *
+ * @param bytes - exact byte length.
+ * @returns a short label such as `916B`, `2.3KB`, or `14MB`.
+ */
+export function fileSizeText(bytes: number): string {
+    if (bytes < 1024) return `${bytes}B`;
+    const kilobytes = bytes / 1024;
+    if (kilobytes < 1024) return `${kilobytes < 10 ? kilobytes.toFixed(1) : Math.round(kilobytes)}KB`;
+    const megabytes = kilobytes / 1024;
+    if (megabytes < 1024) return `${megabytes < 10 ? megabytes.toFixed(1) : Math.round(megabytes)}MB`;
+    const gigabytes = megabytes / 1024;
+    return `${gigabytes < 10 ? gigabytes.toFixed(1) : Math.round(gigabytes)}GB`;
+}
+
+/** Metadata line under a file name: extension first, then size when known. */
+function fileMeta(name: string, bytes: number): string {
+    const extension = fileExtension(name).toUpperCase().slice(0, 8);
+    return [extension, fileSizeText(bytes)].filter((part) => part !== "").join(" ");
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -148,6 +182,56 @@ export function fileDraftsPayload(files: readonly DraftFile[]): DshFileDraft[] {
     return files.map((file) => ({ name: file.name, data: file.data }));
 }
 
+/**
+ * One pending file, presented the way the Harness web composer presents it: a
+ * fixed-size card carrying the type glyph, the name, and extension plus size.
+ */
+export function FileCard({
+    name,
+    bytes,
+    state = "ready",
+    onRemove,
+}: {
+    name: string;
+    bytes: number;
+    state?: "ready" | "uploading" | "error";
+    onRemove?: () => void;
+}): React.JSX.Element {
+    const retryable = state === "error";
+    const meta = state === "uploading"
+        ? t("Uploading...")
+        : state === "error"
+            ? t("Upload failed")
+            : fileMeta(name, bytes);
+    return (
+        <div className={`dsh-file-card${retryable ? " dsh-file-card-failed" : ""}`} title={name}>
+            <span className="dsh-file-card-icon" aria-hidden="true">
+                {state === "uploading"
+                    ? <span className="dsh-file-card-spinner" />
+                    : <FileTypeIcon name={name} size={28} />}
+            </span>
+            <span className="dsh-file-card-body">
+                <span className="dsh-file-card-name">{name}</span>
+                <span className="dsh-file-card-meta">{meta}</span>
+            </span>
+            {onRemove ? (
+                <button
+                    type="button"
+                    className="dsh-file-card-remove"
+                    title={t("Remove file")}
+                    aria-label={t("Remove file")}
+                    onClick={onRemove}
+                >
+                    <CloseIcon />
+                </button>
+            ) : null}
+            {state === "uploading" ? (
+                <span className="dsh-file-card-track"><span className="dsh-file-card-bar" /></span>
+            ) : null}
+        </div>
+    );
+}
+
 export function FileDraftRail({
     files,
     error,
@@ -163,21 +247,12 @@ export function FileDraftRail({
             {files.length ? (
                 <div className="dsh-file-draft-rail" aria-label={t("Pending files")}>
                     {files.map((file) => (
-                        <div className="dsh-file-draft" key={file.id}>
-                            <FileIcon />
-                            <span className="dsh-file-draft-name" title={file.name}>{file.name}</span>
-                            <span className="dsh-file-draft-size">
-                                {t("{size} B", { size: file.bytes.toLocaleString() })}
-                            </span>
-                            <button
-                                type="button"
-                                className="dsh-icon-button"
-                                title={t("Remove file")}
-                                onClick={() => onRemove(file.id)}
-                            >
-                                <CloseIcon />
-                            </button>
-                        </div>
+                        <FileCard
+                            key={file.id}
+                            name={file.name}
+                            bytes={file.bytes}
+                            onRemove={() => onRemove(file.id)}
+                        />
                     ))}
                 </div>
             ) : null}
