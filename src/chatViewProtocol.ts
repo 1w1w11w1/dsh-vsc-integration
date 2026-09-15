@@ -132,8 +132,11 @@ const MAX_MESSAGE_IMAGE_BASE64_CHARACTERS = 128 * 1024 * 1024;
  * The Host re-checks the decoded length against `dsh.maxUploadBytes`; this
  * bound only keeps an oversized message from being decoded at all.
  */
-const MAX_FILE_BASE64_CHARACTERS = 96 * 1024 * 1024;
+// 1 GiB of file bytes encodes to about 1.43e9 base64 characters; the Host
+// re-checks the decoded length against `dsh.maxUploadBytes`.
+const MAX_FILE_BASE64_CHARACTERS = 2 * 1024 * 1024 * 1024;
 const MAX_FILE_DRAFTS = 20;
+const MAX_MESSAGE_FILE_BASE64_CHARACTERS = 8 * 1024 * 1024 * 1024;
 const MAX_FILE_NAME_CHARACTERS = 512;
 const MAX_FILE_PREVIEW_CHARACTERS = 2 * 1024 * 1024;
 
@@ -166,7 +169,7 @@ function fileDrafts(value: unknown): DshFileDraft[] | undefined {
                     candidate.preview.length > MAX_FILE_PREVIEW_CHARACTERS))
         ) return undefined;
         totalCharacters += candidate.data.length;
-        if (totalCharacters > MAX_MESSAGE_IMAGE_BASE64_CHARACTERS) return undefined;
+        if (totalCharacters > MAX_MESSAGE_FILE_BASE64_CHARACTERS) return undefined;
         files.push({
             name: candidate.name,
             data: candidate.data,

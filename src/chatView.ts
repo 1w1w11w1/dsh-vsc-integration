@@ -120,7 +120,7 @@ interface PersistedSession {
 }
 
 /** Default ceiling for one attached file, matching the runtime image allowance. */
-const DEFAULT_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_BYTES = 1024 * 1024 * 1024;
 /** Files one prompt may attach; the Runtime stages each one separately. */
 const MAX_FILES_PER_MESSAGE = 20;
 

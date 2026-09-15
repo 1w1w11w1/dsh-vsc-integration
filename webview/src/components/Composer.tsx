@@ -25,7 +25,7 @@ const MIN_HEIGHT = 56;
 const MAX_HEIGHT = 180;
 
 /** Used before the Host has published its own ceilings, or by the dev page. */
-const DEFAULT_FILE_UPLOAD_LIMITS = { maxBytes: 10 * 1024 * 1024, maxFiles: 20 };
+const DEFAULT_FILE_UPLOAD_LIMITS = { maxBytes: 1024 * 1024 * 1024, maxFiles: 20 };
 
 interface ComposerProps {
     context: ComposerState["context"];
