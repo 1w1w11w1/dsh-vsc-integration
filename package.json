@@ -597,7 +597,7 @@
                 },
                 "dsh.maxUploadBytes": {
                     "type": "number",
-                    "default": 10485760,
+                    "default": 1073741824,
                     "minimum": 1024,
                     "maximum": 1073741824,
                     "description": "%config.maxUploadBytes.description%"
